@@ -48,7 +48,7 @@ def setup_database():
         conn.commit()
     conn.close()
 
-# --- Lógica de Scraping (sin cambios) ---
+# --- Lógica de Scraping ---
 def scrape_swappa(url: str, max_price: float, desired_condition: str, min_battery: int):
     logger.info(f"Iniciando búsqueda para URL: {url}")
     driver = None
@@ -109,9 +109,31 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
     finally:
         if driver: driver.quit()
 
-# --- Comandos del Bot de Telegram (adaptados) ---
+# --- Comandos del Bot de Telegram ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_html("¡Hola! Tu bot de monitoreo en Heroku está funcionando.")
+    await update.message.reply_html(
+        "¡Hola! Soy tu bot de monitoreo para Swappa.\n\n"
+        "<b>Comandos disponibles:</b>\n"
+        "/remind - Configura una nueva alerta y busca de inmediato.\n"
+        "/myreminders - Muestra tus alertas activas.\n"
+        "/stopreminder - Elimina una alerta.\n"
+        "/help - Muestra las instrucciones detalladas."
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_html(
+        "<b>Instrucciones para /remind:</b>\n\n"
+        "Debes proporcionar 5 parámetros:\n"
+        "1. URL de Swappa\n"
+        "2. Precio máximo\n"
+        "3. Condición (Good, Mint, etc.)\n"
+        "4. Batería mínima (<b>usa 0 si no quieres filtrar por batería</b>)\n"
+        "5. Frecuencia en horas (ej. 2, 6, 12)\n\n"
+        "<b>Ejemplo para un iPhone (con batería):</b>\n"
+        "/remind https://swappa.com/listings/apple-iphone-15 700 Good 90 6\n\n"
+        "<b>Ejemplo para un Pixel (sin batería):</b>\n"
+        "/remind https://swappa.com/listings/google-pixel-8 400 Good 0 4"
+    )
 
 async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.message.chat_id)
@@ -121,6 +143,9 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         url, max_price, condition, min_battery, frequency = args
+        max_price_f = float(max_price)
+        min_battery_i = int(min_battery)
+        frequency_i = int(frequency)
         reminder_id = f"reminder_{chat_id}_{int(time.time())}"
         
         conn = db_connect()
@@ -130,26 +155,77 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 INSERT INTO reminders (chat_id, reminder_id, url, max_price, condition, min_battery, frequency_hours, last_checked)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                (chat_id, reminder_id, url, float(max_price), condition, int(min_battery), int(frequency), int(time.time()))
+                (chat_id, reminder_id, url, max_price_f, condition, min_battery_i, frequency_i, int(time.time()))
             )
             conn.commit()
         conn.close()
         
-        await update.message.reply_html(f"✅ <b>Recordatorio configurado.</b> Se buscará cada {frequency} horas.")
-        # ... (La búsqueda inmediata se puede añadir aquí si se desea)
+        await update.message.reply_html(
+            f"✅ <b>Recordatorio configurado.</b> Se buscará cada {frequency} horas.\n\n"
+            f"<i>Realizando la primera búsqueda ahora... Esto puede tardar hasta un minuto.</i> ⏳"
+        )
+        
+        resultado_inicial = await asyncio.to_thread(scrape_swappa, url, max_price_f, condition, min_battery_i)
+
+        if resultado_inicial and "Error" not in resultado_inicial:
+            await update.message.reply_html(resultado_inicial)
+        elif "Error" in (resultado_inicial or ""):
+            await update.message.reply_html(resultado_inicial)
+        else:
+            await update.message.reply_text("Búsqueda inicial completada. No se encontraron ofertas que cumplan tus criterios.")
+
     except ValueError:
-        await update.message.reply_html("⚠️ <b>Parámetros incorrectos.</b>")
+        await update.message.reply_html("⚠️ <b>Parámetros incorrectos.</b> Precio, batería y frecuencia deben ser números.")
     except Exception as e:
         logger.error(f"Error en /remind: {e}")
         await update.message.reply_html("❌ Hubo un error al guardar tu recordatorio.")
 
-# ... (Aquí irían los otros comandos: help, myreminders, stopreminder)
+async def my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.message.chat_id)
+    conn = db_connect()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM reminders WHERE chat_id = %s", (chat_id,))
+        user_reminders = cur.fetchall()
+    conn.close()
+
+    if not user_reminders:
+        await update.message.reply_text("No tienes ningún recordatorio activo.")
+        return
+    
+    message = "<b>Tus recordatorios activos:</b>\n\n"
+    for r in user_reminders:
+        message += f"🆔 <b>ID:</b> <code>{r['reminder_id']}</code>\n"
+        message += f"   - URL: {r['url'][:30]}...\n"
+        message += f"   - Frecuencia: Cada {r['frequency_hours']} horas\n\n"
+    message += "Para eliminar un recordatorio, usa /stopreminder [ID]"
+    await update.message.reply_html(message)
+
+async def stop_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.message.chat_id)
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Por favor, proporciona el ID del recordatorio. Ejemplo: /stopreminder reminder_...")
+        return
+    
+    reminder_id_to_delete = context.args[0]
+    conn = db_connect()
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM reminders WHERE reminder_id = %s AND chat_id = %s",
+            (reminder_id_to_delete, chat_id)
+        )
+        # rowcount nos dice cuántas filas fueron afectadas. Si es > 0, se borró.
+        deleted_count = cur.rowcount
+        conn.commit()
+    conn.close()
+
+    if deleted_count > 0:
+        await update.message.reply_text(f"✅ Recordatorio {reminder_id_to_delete} eliminado.")
+    else:
+        await update.message.reply_text("❌ No se encontró un recordatorio con ese ID o no te pertenece.")
 
 # --- Funciones de Ejecución ---
 async def run_scheduler_check():
-    """Esta es la función que ejecutará Heroku Scheduler."""
     logger.info("Iniciando revisión de todos los recordatorios...")
-    # ... (Lógica de check_all_reminders)
     conn = db_connect()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT * FROM reminders")
@@ -164,36 +240,38 @@ async def run_scheduler_check():
             logger.info(f"Ejecutando recordatorio: {r['reminder_id']}")
             resultado = scrape_swappa(r["url"], r["max_price"], r["condition"], r["min_battery"])
             
-            conn = db_connect()
-            with conn.cursor() as cur:
-                cur.execute("UPDATE reminders SET last_checked = %s WHERE id = %s", (current_time, r['id']))
-                conn.commit()
-            conn.close()
+            conn_update = db_connect()
+            with conn_update.cursor() as cur_update:
+                cur_update.execute("UPDATE reminders SET last_checked = %s WHERE id = %s", (current_time, r['id']))
+                conn_update.commit()
+            conn_update.close()
 
             if resultado and "Error" not in resultado:
                 await bot_app.bot.send_message(chat_id=r["chat_id"], text=resultado, parse_mode='HTML')
     logger.info("Revisión de recordatorios completada.")
 
 def run_bot_polling():
-    """Esta función mantiene al bot escuchando comandos."""
     if not DATABASE_URL or not TELEGRAM_TOKEN:
         logger.error("Faltan variables de entorno.")
         return
     setup_database()
     application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # --- REGISTRO COMPLETO DE COMANDOS ---
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("remind", remind))
-    # ... (Añadir los otros handlers)
+    application.add_handler(CommandHandler("myreminders", my_reminders))
+    application.add_handler(CommandHandler("stopreminder", stop_reminder))
+    
     logger.info("Iniciando el bot en modo polling...")
     application.run_polling()
 
 if __name__ == '__main__':
-    # Esta sección permite decidir qué función ejecutar desde la línea de comandos
     if len(sys.argv) > 1:
         if sys.argv[1] == 'run_bot_polling':
             run_bot_polling()
         elif sys.argv[1] == 'run_scheduler_check':
             asyncio.run(run_scheduler_check())
     else:
-        print("Por favor, especifica una función para ejecutar: 'run_bot_polling' o 'run_scheduler_check'")
-
+        print("Uso: python main.py [run_bot_polling|run_scheduler_check]")
