@@ -3,7 +3,8 @@ import re
 import logging
 import time
 import asyncio
-import psycopg2 # Librería para conectar con la base de datos Postgres
+import sys
+import psycopg2
 from psycopg2.extras import RealDictCursor
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -26,11 +27,9 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # --- Funciones para manejar la Base de Datos Postgres ---
 def db_connect():
-    """Establece conexión con la base de datos."""
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 def setup_database():
-    """Crea la tabla de recordatorios si no existe."""
     conn = db_connect()
     with conn.cursor() as cur:
         cur.execute("""
@@ -58,7 +57,6 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
         options.add_argument('--headless')
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        # Heroku instala Chrome en una ruta específica que UC puede encontrar
         driver = uc.Chrome(options=options)
         
         driver.get(url)
@@ -111,7 +109,7 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
     finally:
         if driver: driver.quit()
 
-# --- Comandos del Bot de Telegram ---
+# --- Comandos del Bot de Telegram (adaptados) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html("¡Hola! Tu bot de monitoreo en Heroku está funcionando.")
 
@@ -138,15 +136,20 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         
         await update.message.reply_html(f"✅ <b>Recordatorio configurado.</b> Se buscará cada {frequency} horas.")
-        # ... (Lógica de búsqueda inmediata)
+        # ... (La búsqueda inmediata se puede añadir aquí si se desea)
     except ValueError:
         await update.message.reply_html("⚠️ <b>Parámetros incorrectos.</b>")
+    except Exception as e:
+        logger.error(f"Error en /remind: {e}")
+        await update.message.reply_html("❌ Hubo un error al guardar tu recordatorio.")
 
-# ... (Aquí irían los otros comandos: help, myreminders, stopreminder, adaptados para usar la base de datos Postgres)
+# ... (Aquí irían los otros comandos: help, myreminders, stopreminder)
 
-# --- Lógica para la Tarea Programada (Heroku Scheduler) ---
-async def check_all_reminders():
+# --- Funciones de Ejecución ---
+async def run_scheduler_check():
+    """Esta es la función que ejecutará Heroku Scheduler."""
     logger.info("Iniciando revisión de todos los recordatorios...")
+    # ... (Lógica de check_all_reminders)
     conn = db_connect()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT * FROM reminders")
@@ -171,16 +174,8 @@ async def check_all_reminders():
                 await bot_app.bot.send_message(chat_id=r["chat_id"], text=resultado, parse_mode='HTML')
     logger.info("Revisión de recordatorios completada.")
 
-def main():
-    """Esta función se usará para la tarea programada."""
-    if not DATABASE_URL or not TELEGRAM_TOKEN:
-        logger.error("Faltan variables de entorno (DATABASE_URL o TELEGRAM_TOKEN).")
-        return
-    setup_database()
-    asyncio.run(check_all_reminders())
-
-def bot_main():
-    """Esta función se usará para el bot interactivo."""
+def run_bot_polling():
+    """Esta función mantiene al bot escuchando comandos."""
     if not DATABASE_URL or not TELEGRAM_TOKEN:
         logger.error("Faltan variables de entorno.")
         return
@@ -189,9 +184,16 @@ def bot_main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("remind", remind))
     # ... (Añadir los otros handlers)
-    logger.info("Iniciando el bot...")
+    logger.info("Iniciando el bot en modo polling...")
     application.run_polling()
 
 if __name__ == '__main__':
-    # Esto permite ejecutar la revisión manualmente para pruebas
-    main()
+    # Esta sección permite decidir qué función ejecutar desde la línea de comandos
+    if len(sys.argv) > 1:
+        if sys.argv[1] == 'run_bot_polling':
+            run_bot_polling()
+        elif sys.argv[1] == 'run_scheduler_check':
+            asyncio.run(run_scheduler_check())
+    else:
+        print("Por favor, especifica una función para ejecutar: 'run_bot_polling' o 'run_scheduler_check'")
+
