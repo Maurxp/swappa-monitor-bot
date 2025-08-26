@@ -1,0 +1,5 @@
+python-telegram-bot
+undetected-chromedriver
+beautifulsoup4
+requests
+psycopg2-binary
