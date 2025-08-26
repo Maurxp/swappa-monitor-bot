@@ -126,13 +126,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Debes proporcionar 5 parámetros:\n"
         "1. URL de Swappa\n"
         "2. Precio máximo\n"
-        "3. Condición (Good, Mint, etc.)\n"
-        "4. Batería mínima (<b>usa 0 si no quieres filtrar por batería</b>)\n"
+        "3. Condición (Good, Mint, Fair, New.)\n"
+        "4. Batería mínima (<b>Usa 0 si no quieres filtrar por batería</b>)\n"
         "5. Frecuencia en horas (ej. 2, 6, 12)\n\n"
-        "<b>Ejemplo para un iPhone (con batería):</b>\n"
+        "<b>Ejemplo para un iPhone (Con batería):</b>\n"
         "/remind https://swappa.com/listings/apple-iphone-15 700 Good 90 6\n\n"
-        "<b>Ejemplo para un Pixel (sin batería):</b>\n"
-        "/remind https://swappa.com/listings/google-pixel-8 400 Good 0 4"
+        "<b>Ejemplo para un Google Pixel (O Cualquier dispositivo sin batería a mostrar):</b>\n"
+        "/remind https://swappa.com/listings/google-pixel-8 400 Good 0 4\n\n"
+        "<b>Recuerda el formato:</b>\n"
+        "/remind [url_swappa] [precio_max] [condicion] [bateria] [frecuencia]"
     )
 
 async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -192,11 +194,19 @@ async def my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No tienes ningún recordatorio activo.")
         return
     
-    message = "<b>Tus recordatorios activos:</b>\n\n"
+    message = "<b>Tus recordatorios activos:</b>\n"
     for r in user_reminders:
+        # --- ESTA ES LA SECCIÓN MEJORADA ---
+        bateria_info = f"{r['min_battery']}%" if r['min_battery'] > 0 else "Ignorada"
+        message += "----------------------------------\n"
         message += f"🆔 <b>ID:</b> <code>{r['reminder_id']}</code>\n"
-        message += f"   - URL: {r['url'][:30]}...\n"
-        message += f"   - Frecuencia: Cada {r['frequency_hours']} horas\n\n"
+        message += f"🔗 <b>URL:</b> {r['url']}\n"
+        message += f"💰 <b>Precio Máx:</b> ${r['max_price']}\n"
+        message += f"✨ <b>Condición:</b> {r['condition']}\n"
+        message += f"🔋 <b>Batería Mín:</b> {bateria_info}\n"
+        message += f"⏰ <b>Frecuencia:</b> Cada {r['frequency_hours']} horas\n"
+    
+    message += "----------------------------------\n\n"
     message += "Para eliminar un recordatorio, usa /stopreminder [ID]"
     await update.message.reply_html(message)
 
@@ -213,7 +223,6 @@ async def stop_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "DELETE FROM reminders WHERE reminder_id = %s AND chat_id = %s",
             (reminder_id_to_delete, chat_id)
         )
-        # rowcount nos dice cuántas filas fueron afectadas. Si es > 0, se borró.
         deleted_count = cur.rowcount
         conn.commit()
     conn.close()
@@ -257,7 +266,6 @@ def run_bot_polling():
     setup_database()
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # --- REGISTRO COMPLETO DE COMANDOS ---
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("remind", remind))
