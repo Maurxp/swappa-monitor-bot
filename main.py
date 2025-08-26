@@ -41,7 +41,7 @@ def setup_database():
                 max_price REAL NOT NULL,
                 condition VARCHAR(255) NOT NULL,
                 min_battery INTEGER NOT NULL,
-                frequency_hours INTEGER NOT NULL,
+                frequency_seconds INTEGER NOT NULL, -- Cambiado a segundos para mayor flexibilidad
                 last_checked BIGINT NOT NULL
             );
         """)
@@ -112,12 +112,13 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
 # --- Comandos del Bot de Telegram ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
-        "¡Hola! Soy tu bot de monitoreo para Swappa.\n\n"
+        "¡Hola! Soy tu bot de monitoreo de precios para Swappa.\n\n"
         "<b>Comandos disponibles:</b>\n"
         "/remind - Configura una nueva alerta y busca de inmediato.\n"
         "/myreminders - Muestra tus alertas activas.\n"
         "/stopreminder - Elimina una alerta.\n"
-        "/help - Muestra las instrucciones detalladas."
+        "/help - Muestra las instrucciones detalladas.\n\n"
+        "<i>Bot desarrollado con mucho 💚 por @devmauro</i>"
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -125,14 +126,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Instrucciones para /remind:</b>\n\n"
         "Debes proporcionar 5 parámetros:\n"
         "1. URL de Swappa\n"
-        "2. Precio máximo\n"
-        "3. Condición (Good, Mint, Fair, New.)\n"
-        "4. Batería mínima (<b>Usa 0 si no quieres filtrar por batería</b>)\n"
-        "5. Frecuencia en horas (ej. 2, 6, 12)\n\n"
-        "<b>Ejemplo para un iPhone (Con batería):</b>\n"
-        "/remind https://swappa.com/listings/apple-iphone-15 700 Good 90 6\n\n"
-        "<b>Ejemplo para un Google Pixel (O Cualquier dispositivo sin batería a mostrar):</b>\n"
-        "/remind https://swappa.com/listings/google-pixel-8 400 Good 0 4\n\n"
+        "2. Precio Máximo\n"
+        "3. Condición (Good, Mint, New, Fair, Used, etc.)\n"
+        "4. Batería Mínima (<b>Usa 0 si no quieres filtrar por batería</b>)\n"
+        "5. Frecuencia (ej. <b>30m</b> para 30 minutos, <b>2h</b> para 2 horas)\n\n"
+        "<b>Ejemplo (cada 2 horas):</b>\n"
+        "/remind https://swappa.com/listings/apple-iphone-15 700 Good 90 2h\n\n"
+        "<b>Ejemplo (cada 45 minutos):</b>\n"
+        "/remind https://swappa.com/listings/google-pixel-8 400 Good 0 45m\n\n"
         "<b>Recuerda el formato:</b>\n"
         "/remind [url_swappa] [precio_max] [condicion] [bateria] [frecuencia]"
     )
@@ -144,27 +145,41 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html("⚠️ <b>Formato incorrecto.</b> Necesito 5 parámetros. Usa /help.")
         return
     try:
-        url, max_price, condition, min_battery, frequency = args
+        url, max_price, condition, min_battery, frequency_str = args
         max_price_f = float(max_price)
         min_battery_i = int(min_battery)
-        frequency_i = int(frequency)
+        
+        # --- NUEVA LÓGICA PARA EL TIEMPO ---
+        time_value = int(re.findall(r'\d+', frequency_str)[0])
+        time_unit = re.findall(r'[a-zA-Z]+', frequency_str)[0].lower()
+
+        if time_unit == 'h':
+            frequency_seconds = time_value * 3600
+            display_freq = f"{time_value} horas"
+        elif time_unit == 'm':
+            frequency_seconds = time_value * 60
+            display_freq = f"{time_value} minutos"
+        else:
+            await update.message.reply_html("⚠️ <b>Unidad de tiempo inválida.</b> Usa 'h' para horas o 'm' para minutos.")
+            return
+
         reminder_id = f"reminder_{chat_id}_{int(time.time())}"
         
         conn = db_connect()
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO reminders (chat_id, reminder_id, url, max_price, condition, min_battery, frequency_hours, last_checked)
+                INSERT INTO reminders (chat_id, reminder_id, url, max_price, condition, min_battery, frequency_seconds, last_checked)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                (chat_id, reminder_id, url, max_price_f, condition, min_battery_i, frequency_i, int(time.time()))
+                (chat_id, reminder_id, url, max_price_f, condition, min_battery_i, frequency_seconds, int(time.time()))
             )
             conn.commit()
         conn.close()
         
         await update.message.reply_html(
-            f"✅ <b>Recordatorio configurado.</b> Se buscará cada {frequency} horas.\n\n"
-            f"<i>Realizando la primera búsqueda ahora... Esto puede tardar hasta un minuto.</i> ⏳"
+            f"✅ <b>Recordatorio configurado.</b> Se buscará cada {display_freq}.\n\n"
+            f"<i>Realizando la primera búsqueda ahora...</i> ⏳"
         )
         
         resultado_inicial = await asyncio.to_thread(scrape_swappa, url, max_price_f, condition, min_battery_i)
@@ -176,8 +191,8 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("Búsqueda inicial completada. No se encontraron ofertas que cumplan tus criterios.")
 
-    except ValueError:
-        await update.message.reply_html("⚠️ <b>Parámetros incorrectos.</b> Precio, batería y frecuencia deben ser números.")
+    except (ValueError, IndexError):
+        await update.message.reply_html("⚠️ <b>Parámetros incorrectos.</b> Revisa el formato y usa /help.")
     except Exception as e:
         logger.error(f"Error en /remind: {e}")
         await update.message.reply_html("❌ Hubo un error al guardar tu recordatorio.")
@@ -196,15 +211,22 @@ async def my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     message = "<b>Tus recordatorios activos:</b>\n"
     for r in user_reminders:
-        # --- ESTA ES LA SECCIÓN MEJORADA ---
-        bateria_info = f"{r['min_battery']}%" if r['min_battery'] > 0 else "Ignorada"
+        bateria_info = f"{r['min_battery']}%" if r['min_battery'] > 0 else "No Aplica"
+        
+        # --- NUEVA LÓGICA PARA MOSTRAR EL TIEMPO ---
+        freq_seconds = r['frequency_seconds']
+        if freq_seconds >= 3600:
+            display_freq = f"Cada {freq_seconds // 3600} horas"
+        else:
+            display_freq = f"Cada {freq_seconds // 60} minutos"
+
         message += "----------------------------------\n"
         message += f"🆔 <b>ID:</b> <code>{r['reminder_id']}</code>\n"
         message += f"🔗 <b>URL:</b> {r['url']}\n"
         message += f"💰 <b>Precio Máx:</b> ${r['max_price']}\n"
         message += f"✨ <b>Condición:</b> {r['condition']}\n"
         message += f"🔋 <b>Batería Mín:</b> {bateria_info}\n"
-        message += f"⏰ <b>Frecuencia:</b> Cada {r['frequency_hours']} horas\n"
+        message += f"⏰ <b>Frecuencia:</b> {display_freq}\n"
     
     message += "----------------------------------\n\n"
     message += "Para eliminar un recordatorio, usa /stopreminder [ID]"
@@ -245,7 +267,7 @@ async def run_scheduler_check():
     bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     for r in reminders:
-        if current_time - r['last_checked'] > r['frequency_hours'] * 3600:
+        if current_time - r['last_checked'] > r['frequency_seconds']:
             logger.info(f"Ejecutando recordatorio: {r['reminder_id']}")
             resultado = scrape_swappa(r["url"], r["max_price"], r["condition"], r["min_battery"])
             
