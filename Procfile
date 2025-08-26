@@ -1,1 +1,1 @@
-worker: python main.py run_bot_polling
+worker: python3 main.py run_bot_polling
