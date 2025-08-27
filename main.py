@@ -5,6 +5,7 @@ import time
 import asyncio
 import sys
 import psycopg2
+import requests # Usaremos requests para obtener el nombre del producto rápidamente
 from psycopg2.extras import RealDictCursor
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -32,7 +33,7 @@ def db_connect():
 def setup_database():
     conn = db_connect()
     with conn.cursor() as cur:
-        # Usamos la nueva columna frequency_seconds
+        # Añadimos la columna device_name para identificar los recordatorios
         cur.execute("""
             CREATE TABLE IF NOT EXISTS reminders (
                 id SERIAL PRIMARY KEY,
@@ -43,15 +44,34 @@ def setup_database():
                 condition VARCHAR(255) NOT NULL,
                 min_battery INTEGER NOT NULL,
                 frequency_seconds INTEGER NOT NULL,
-                last_checked BIGINT NOT NULL
+                last_checked BIGINT NOT NULL,
+                device_name TEXT
             );
         """)
+        # Asegurarnos de que la columna existe si la tabla ya fue creada
+        cur.execute("ALTER TABLE reminders ADD COLUMN IF NOT EXISTS device_name TEXT;")
         conn.commit()
     conn.close()
 
-# --- Lógica de Scraping ---
-def scrape_swappa(url: str, max_price: float, desired_condition: str, min_battery: int):
-    logger.info(f"Iniciando búsqueda para URL: {url}")
+# --- Nueva Función para Obtener el Nombre del Producto ---
+def get_device_name(url: str):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        page = requests.get(url, headers=headers)
+        page.raise_for_status()
+        soup = BeautifulSoup(page.content, 'html.parser')
+        # El nombre está en el primer <span> dentro del <h1>
+        name_tag = soup.find('h1').find('span')
+        if name_tag:
+            return name_tag.text.strip()
+        return "Producto Desconocido"
+    except Exception as e:
+        logger.error(f"No se pudo obtener el nombre del dispositivo de {url}: {e}")
+        return "Producto Desconocido"
+
+# --- Lógica de Scraping Mejorada ---
+def scrape_swappa(url: str, max_price: float, desired_condition: str, min_battery: int, device_name: str):
+    logger.info(f"Iniciando búsqueda para {device_name} en URL: {url}")
     driver = None
     try:
         options = uc.ChromeOptions()
@@ -74,9 +94,20 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                 precio_tag = anuncio.find('span', itemprop='price')
                 if not precio_tag: continue
                 precio = float(precio_tag.text.strip())
+                
                 condicion_tag = anuncio.find('meta', itemprop='itemCondition')
                 if not condicion_tag: continue
                 estado = condicion_tag.parent.text.strip()
+
+                # --- EXTRACCIÓN DE NUEVOS DATOS ---
+                vendedor_tag = anuncio.find('span', itemprop='name')
+                vendedor = vendedor_tag.text.strip() if vendedor_tag else "N/A"
+                
+                # Buscamos todos los 'td' con clase 'col_featured' para identificarlos por posición
+                all_tds = anuncio.find_all('td', class_='col_featured')
+                color = all_tds[1].text.strip() if len(all_tds) > 1 else "N/A"
+                almacenamiento = all_tds[2].text.strip() if len(all_tds) > 2 else "N/A"
+
                 bateria = 0
                 cumple_bateria = False
                 if min_battery > 0:
@@ -87,26 +118,34 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                     cumple_bateria = bateria >= min_battery
                 else:
                     cumple_bateria = True
+                
                 link_tag = anuncio.find('a', href=True)
                 link = "https://swappa.com" + link_tag['href'] if link_tag else "Enlace no encontrado"
+
                 if precio < max_price and estado.lower() == desired_condition.lower() and cumple_bateria:
-                    dispositivos_encontrados.append({ "precio": precio, "estado": estado, "bateria": bateria, "link": link })
-            except (ValueError, AttributeError): continue
+                    dispositivos_encontrados.append({
+                        "precio": precio, "estado": estado, "bateria": bateria, "link": link,
+                        "vendedor": vendedor, "color": color, "almacenamiento": almacenamiento
+                    })
+            except (ValueError, AttributeError, IndexError): continue
         
         if dispositivos_encontrados:
-            mensaje_final = "<b>🔔 ¡Alerta de Swappa! Se encontraron ofertas:</b>\n\n"
+            mensaje_final = f"<b>🔔 ¡Alerta de Swappa! Se encontraron ofertas de {device_name}:</b>\n\n"
             for dispositivo in dispositivos_encontrados:
                 mensaje_final += f"📱 <b>Precio: ${dispositivo['precio']}</b>\n"
                 mensaje_final += f"   - Estado: {dispositivo['estado']}\n"
                 if min_battery > 0:
                     mensaje_final += f"   - Batería: {dispositivo.get('bateria', 'N/A')}%\n"
+                mensaje_final += f"   - Almacenamiento: {dispositivo['almacenamiento']}\n"
+                mensaje_final += f"   - Color: {dispositivo['color']}\n"
+                mensaje_final += f"   - Vendedor: {dispositivo['vendedor']}\n"
                 mensaje_final += f"   - <a href='{dispositivo['link']}'>Ver Anuncio</a>\n\n"
             return mensaje_final
         else:
             return None
     except Exception as e:
         logger.error(f"Error durante el scraping: {e}")
-        return f"⚠️ <b>Error en la búsqueda para {url}:</b>\n<pre>{e}</pre>"
+        return f"⚠️ <b>Error en la búsqueda para {device_name}:</b>\n<pre>{e}</pre>"
     finally:
         if driver: driver.quit()
 
@@ -147,6 +186,9 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         url, max_price, condition, min_battery, frequency_str = args
+        await update.message.reply_text("🤖 Obteniendo información del producto...")
+        device_name = await asyncio.to_thread(get_device_name, url)
+
         max_price_f = float(max_price)
         min_battery_i = int(min_battery)
         
@@ -169,27 +211,27 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO reminders (chat_id, reminder_id, url, max_price, condition, min_battery, frequency_seconds, last_checked)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO reminders (chat_id, reminder_id, url, max_price, condition, min_battery, frequency_seconds, last_checked, device_name)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                (chat_id, reminder_id, url, max_price_f, condition, min_battery_i, frequency_seconds, int(time.time()))
+                (chat_id, reminder_id, url, max_price_f, condition, min_battery_i, frequency_seconds, int(time.time()), device_name)
             )
             conn.commit()
         conn.close()
         
         await update.message.reply_html(
-            f"✅ <b>Recordatorio configurado.</b> Se buscará cada {display_freq}.\n\n"
+            f"✅ <b>Recordatorio configurado para {device_name}.</b> Se buscará cada {display_freq}.\n\n"
             f"<i>Realizando la primera búsqueda ahora...</i> 🔍"
         )
         
-        resultado_inicial = await asyncio.to_thread(scrape_swappa, url, max_price_f, condition, min_battery_i)
+        resultado_inicial = await asyncio.to_thread(scrape_swappa, url, max_price_f, condition, min_battery_i, device_name)
 
         if resultado_inicial and "Error" not in resultado_inicial:
             await update.message.reply_html(resultado_inicial)
         elif "Error" in (resultado_inicial or ""):
             await update.message.reply_html(resultado_inicial)
         else:
-            await update.message.reply_text("🔍 Búsqueda inicial completada. No se encontraron ofertas que cumplan tus criterios.")
+            await update.message.reply_text("😥 Búsqueda inicial completada. No se encontraron ofertas que cumplan tus criterios.")
 
     except (ValueError, IndexError):
         await update.message.reply_html("⚠️ <b>Parámetros incorrectos.</b> Revisa el formato y usa /help.")
@@ -209,23 +251,18 @@ async def my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("‼ No tienes ningún recordatorio activo.")
         return
     
-    message = "<b>✨ Tus recordatorios activos:</b>\n"
+    message = "<b>📍 Tus recordatorios activos:</b>\n"
     for r in user_reminders:
         bateria_info = f"{r['min_battery']}%" if r['min_battery'] > 0 else "No Aplica"
-        
-        # --- CÓDIGO MÁS ROBUSTO PARA MANEJAR DATOS ANTIGUOS Y NUEVOS ---
         freq_seconds = r.get('frequency_seconds')
-        if freq_seconds:
-            if freq_seconds >= 3600:
-                display_freq = f"Cada {freq_seconds // 3600} horas"
-            else:
-                display_freq = f"Cada {freq_seconds // 60} minutos"
-        else: # Fallback por si encuentra un dato con la estructura antigua
-            display_freq = f"Cada {r.get('frequency_hours', 'N/A')} horas"
+        if freq_seconds >= 3600:
+            display_freq = f"Cada {freq_seconds // 3600} horas"
+        else:
+            display_freq = f"Cada {freq_seconds // 60} minutos"
 
         message += "----------------------------------\n"
+        message += f"📱 <b>{r.get('device_name', 'Producto Desconocido')}</b>\n"
         message += f"🆔 <b>ID:</b> <code>{r['reminder_id']}</code>\n"
-        message += f"🔗 <b>URL:</b> {r['url']}\n"
         message += f"💰 <b>Precio Máx:</b> ${r['max_price']}\n"
         message += f"✨ <b>Condición:</b> {r['condition']}\n"
         message += f"🔋 <b>Batería Mín:</b> {bateria_info}\n"
@@ -238,7 +275,7 @@ async def my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stop_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.message.chat_id)
     if not context.args or len(context.args) != 1:
-        await update.message.reply_text("‼ Por favor, proporciona el ID del recordatorio.")
+        await update.message.reply_text("Por favor, proporciona el ID del recordatorio.")
         return
     
     reminder_id_to_delete = context.args[0]
@@ -273,7 +310,7 @@ async def run_scheduler_check():
         freq_seconds = r.get('frequency_seconds', r.get('frequency_hours', 1) * 3600)
         if current_time - r['last_checked'] > freq_seconds:
             logger.info(f"Ejecutando recordatorio: {r['reminder_id']}")
-            resultado = scrape_swappa(r["url"], r["max_price"], r["condition"], r["min_battery"])
+            resultado = scrape_swappa(r["url"], r["max_price"], r["condition"], r["min_battery"], r.get("device_name", "Producto"))
             
             conn_update = db_connect()
             with conn_update.cursor() as cur_update:
