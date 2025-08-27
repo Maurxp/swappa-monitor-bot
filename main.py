@@ -69,10 +69,11 @@ def get_device_name(url: str):
         logger.error(f"No se pudo obtener el nombre del dispositivo de {url}: {e}")
         return "Producto Desconocido"
 
-# --- Lógica de Scraping Mejorada ---
+# --- Lógica de Scraping con Paginación ---
 def scrape_swappa(url: str, max_price: float, desired_condition: str, min_battery: int, device_name: str):
-    logger.info(f"Iniciando búsqueda para {device_name} en URL: {url}")
+    logger.info(f"Iniciando búsqueda para {device_name} en URL base: {url}")
     driver = None
+    all_found_devices = []
     try:
         options = uc.ChromeOptions()
         options.add_argument('--headless')
@@ -80,84 +81,94 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
         options.add_argument("--disable-dev-shm-usage")
         driver = uc.Chrome(options=options)
         
-        driver.get(url)
-        wait = WebDriverWait(driver, 30)
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'tr[itemprop="offers"]')))
-        html_content = driver.page_source
-        soup = BeautifulSoup(html_content, 'html.parser')
-        anuncios = soup.find_all('tr', itemprop='offers')
-        if not anuncios: return "No se encontraron anuncios en la página."
-        
-        dispositivos_encontrados = []
-        for anuncio in anuncios:
+        # --- BUCLE PARA REVISAR LAS PRIMERAS 3 PÁGINAS ---
+        for page_num in range(1, 4):
+            if page_num == 1:
+                page_url = url
+            else:
+                # Añadir el parámetro &page=N a la URL
+                separator = '&' if '?' in url else '?'
+                page_url = f"{url}{separator}page={page_num}"
+            
+            logger.info(f"Revisando página {page_num}: {page_url}")
+            driver.get(page_url)
+            
+            # Esperamos a que los anuncios carguen en cada página
             try:
-                precio_tag = anuncio.find('span', itemprop='price')
-                if not precio_tag: continue
-                precio = float(precio_tag.text.strip())
-                
-                condicion_tag = anuncio.find('meta', itemprop='itemCondition')
-                if not condicion_tag: continue
-                estado = condicion_tag.parent.text.strip()
+                wait = WebDriverWait(driver, 20) # Tiempo de espera más corto para páginas secundarias
+                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'tr[itemprop="offers"]')))
+            except Exception:
+                logger.info(f"No se encontraron anuncios en la página {page_num} o la página no existe. Terminando búsqueda.")
+                break # Si una página no carga anuncios, salimos del bucle
 
-                vendedor_tag = anuncio.find('span', itemprop='name')
-                vendedor = vendedor_tag.text.strip() if vendedor_tag else "N/A"
-                
-                # --- LÓGICA DE EXTRACCIÓN DEFINITIVA ---
-                color = "N/A"
-                almacenamiento = "N/A"
-                
-                title_tag = anuncio.find('a', title=True)
-                if title_tag and title_tag.get('title'):
-                    title_text = title_tag.get('title')
-                    if ' - ' in title_text:
-                        specs_part = title_text.split(' - ', 1)[-1]
-                        specs_list = [spec.strip() for spec in specs_part.split(',')]
-                        
-                        # 1. Extraer almacenamiento (el valor más grande en GB o TB)
-                        storage_options = []
-                        for spec in specs_list:
-                            match = re.search(r'(\d+)\s*(GB|TB)', spec, re.IGNORECASE)
-                            if match:
-                                value = int(match.group(1))
-                                unit = match.group(2).upper()
-                                # Convertir todo a GB para comparar fácilmente
-                                normalized_value = value * 1024 if unit == 'TB' else value
-                                storage_options.append((normalized_value, spec))
-                        
-                        if storage_options:
-                            # Encontrar la tupla con el valor normalizado más grande y usar su string original
-                            almacenamiento = max(storage_options, key=lambda item: item[0])[1]
+            html_content = driver.page_source
+            soup = BeautifulSoup(html_content, 'html.parser')
+            anuncios = soup.find_all('tr', itemprop='offers')
+            
+            for anuncio in anuncios:
+                try:
+                    precio_tag = anuncio.find('span', itemprop='price')
+                    if not precio_tag: continue
+                    precio = float(precio_tag.text.strip())
+                    
+                    condicion_tag = anuncio.find('meta', itemprop='itemCondition')
+                    if not condicion_tag: continue
+                    estado = condicion_tag.parent.text.strip()
 
-                        # 2. Extraer color (generalmente el segundo elemento)
-                        if len(specs_list) > 1:
-                            # Evitar que el almacenamiento o el carrier se confundan con el color
-                            if specs_list[1] != almacenamiento and "unlocked" not in specs_list[1].lower():
-                                color = specs_list[1]
+                    vendedor_tag = anuncio.find('span', itemprop='name')
+                    vendedor = vendedor_tag.text.strip() if vendedor_tag else "N/A"
+                    
+                    # --- LÓGICA DE EXTRACCIÓN DEFINITIVA ---
+                    color = "N/A"
+                    almacenamiento = "N/A"
+                    
+                    title_tag = anuncio.find('a', title=True)
+                    if title_tag and title_tag.get('title'):
+                        title_text = title_tag.get('title')
+                        if ' - ' in title_text:
+                            specs_part = title_text.split(' - ', 1)[-1]
+                            specs_list = [spec.strip() for spec in specs_part.split(',')]
+                            
+                            storage_options = []
+                            for spec in specs_list:
+                                match = re.search(r'(\d+)\s*(GB|TB)', spec, re.IGNORECASE)
+                                if match:
+                                    value = int(match.group(1))
+                                    unit = match.group(2).upper()
+                                    normalized_value = value * 1024 if unit == 'TB' else value
+                                    storage_options.append((normalized_value, spec))
+                            
+                            if storage_options:
+                                almacenamiento = max(storage_options, key=lambda item: item[0])[1]
 
-                bateria = 0
-                cumple_bateria = False
-                if min_battery > 0:
-                    bateria_tag = anuncio.find('td', class_='col_featured', tabindex='0')
-                    if bateria_tag and '%' in bateria_tag.text:
-                        bateria_match = re.search(r'(\d+)', bateria_tag.text)
-                        if bateria_match: bateria = int(bateria_match.group(1))
-                    cumple_bateria = bateria >= min_battery
-                else:
-                    cumple_bateria = True
-                
-                link_tag = anuncio.find('a', href=True)
-                link = "https://swappa.com" + link_tag['href'] if link_tag else "Enlace no encontrado"
+                            if len(specs_list) > 1:
+                                if specs_list[1] != almacenamiento and "unlocked" not in specs_list[1].lower():
+                                    color = specs_list[1]
 
-                if precio < max_price and estado.lower() == desired_condition.lower() and cumple_bateria:
-                    dispositivos_encontrados.append({
-                        "precio": precio, "estado": estado, "bateria": bateria, "link": link,
-                        "vendedor": vendedor, "color": color, "almacenamiento": almacenamiento
-                    })
-            except (ValueError, AttributeError, IndexError): continue
+                    bateria = 0
+                    cumple_bateria = False
+                    if min_battery > 0:
+                        bateria_tag = anuncio.find('td', class_='col_featured', tabindex='0')
+                        if bateria_tag and '%' in bateria_tag.text:
+                            bateria_match = re.search(r'(\d+)', bateria_tag.text)
+                            if bateria_match: bateria = int(bateria_match.group(1))
+                        cumple_bateria = bateria >= min_battery
+                    else:
+                        cumple_bateria = True
+                    
+                    link_tag = anuncio.find('a', href=True)
+                    link = "https://swappa.com" + link_tag['href'] if link_tag else "Enlace no encontrado"
+
+                    if precio < max_price and estado.lower() == desired_condition.lower() and cumple_bateria:
+                        all_found_devices.append({
+                            "precio": precio, "estado": estado, "bateria": bateria, "link": link,
+                            "vendedor": vendedor, "color": color, "almacenamiento": almacenamiento
+                        })
+                except (ValueError, AttributeError, IndexError): continue
         
-        if dispositivos_encontrados:
-            mensaje_final = f"<b>🔔 ¡Alerta de Swappa! Se encontraron ofertas de {device_name}:</b>\n\n"
-            for dispositivo in dispositivos_encontrados:
+        if all_found_devices:
+            mensaje_final = f"<b>🔔 ¡Alerta de Swappa! Se encontraron {len(all_found_devices)} ofertas de {device_name}:</b>\n\n"
+            for dispositivo in all_found_devices:
                 mensaje_final += f"📱 <b>Precio: ${dispositivo['precio']}</b>\n"
                 mensaje_final += f"   - Estado: {dispositivo['estado']}\n"
                 if min_battery > 0:
@@ -247,7 +258,7 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_html(
             f"✅ <b>Recordatorio configurado para {device_name}.</b> Se buscará cada {display_freq}.\n\n"
-            f"<i>Realizando la primera búsqueda ahora...</i> 🔍"
+            f"<i>Realizando la primera búsqueda en las 3 primeras páginas...</i> 🔍"
         )
         
         resultado_inicial = await asyncio.to_thread(scrape_swappa, url, max_price_f, condition, min_battery_i, device_name)
