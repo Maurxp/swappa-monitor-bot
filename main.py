@@ -99,14 +99,40 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                 if not condicion_tag: continue
                 estado = condicion_tag.parent.text.strip()
 
-                # --- EXTRACCIÓN DE NUEVOS DATOS ---
                 vendedor_tag = anuncio.find('span', itemprop='name')
                 vendedor = vendedor_tag.text.strip() if vendedor_tag else "N/A"
                 
-                # Buscamos todos los 'td' con clase 'col_featured' para identificarlos por posición
-                all_tds = anuncio.find_all('td', class_='col_featured')
-                color = all_tds[1].text.strip() if len(all_tds) > 1 else "N/A"
-                almacenamiento = all_tds[2].text.strip() if len(all_tds) > 2 else "N/A"
+                # --- LÓGICA DE EXTRACCIÓN DEFINITIVA ---
+                color = "N/A"
+                almacenamiento = "N/A"
+                
+                title_tag = anuncio.find('a', title=True)
+                if title_tag and title_tag.get('title'):
+                    title_text = title_tag.get('title')
+                    if ' - ' in title_text:
+                        specs_part = title_text.split(' - ', 1)[-1]
+                        specs_list = [spec.strip() for spec in specs_part.split(',')]
+                        
+                        # 1. Extraer almacenamiento (el valor más grande en GB o TB)
+                        storage_options = []
+                        for spec in specs_list:
+                            match = re.search(r'(\d+)\s*(GB|TB)', spec, re.IGNORECASE)
+                            if match:
+                                value = int(match.group(1))
+                                unit = match.group(2).upper()
+                                # Convertir todo a GB para comparar fácilmente
+                                normalized_value = value * 1024 if unit == 'TB' else value
+                                storage_options.append((normalized_value, spec))
+                        
+                        if storage_options:
+                            # Encontrar la tupla con el valor normalizado más grande y usar su string original
+                            almacenamiento = max(storage_options, key=lambda item: item[0])[1]
+
+                        # 2. Extraer color (generalmente el segundo elemento)
+                        if len(specs_list) > 1:
+                            # Evitar que el almacenamiento o el carrier se confundan con el color
+                            if specs_list[1] != almacenamiento and "unlocked" not in specs_list[1].lower():
+                                color = specs_list[1]
 
                 bateria = 0
                 cumple_bateria = False
