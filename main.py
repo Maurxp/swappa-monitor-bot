@@ -69,11 +69,12 @@ def get_device_name(url: str):
         logger.error(f"No se pudo obtener el nombre del dispositivo de {url}: {e}")
         return "Producto Desconocido"
 
-# --- Lógica de Scraping con Paginación ---
+# --- Lógica de Scraping con Paginación y Anti-Duplicados ---
 def scrape_swappa(url: str, max_price: float, desired_condition: str, min_battery: int, device_name: str):
     logger.info(f"Iniciando búsqueda para {device_name} en URL base: {url}")
     driver = None
     all_found_devices = []
+    processed_links = set() # Usamos un set para guardar los links ya procesados y evitar duplicados
     try:
         options = uc.ChromeOptions()
         options.add_argument('--headless')
@@ -86,20 +87,18 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
             if page_num == 1:
                 page_url = url
             else:
-                # Añadir el parámetro &page=N a la URL
                 separator = '&' if '?' in url else '?'
                 page_url = f"{url}{separator}page={page_num}"
             
             logger.info(f"Revisando página {page_num}: {page_url}")
             driver.get(page_url)
             
-            # Esperamos a que los anuncios carguen en cada página
             try:
-                wait = WebDriverWait(driver, 20) # Tiempo de espera más corto para páginas secundarias
+                wait = WebDriverWait(driver, 20)
                 wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'tr[itemprop="offers"]')))
             except Exception:
                 logger.info(f"No se encontraron anuncios en la página {page_num} o la página no existe. Terminando búsqueda.")
-                break # Si una página no carga anuncios, salimos del bucle
+                break
 
             html_content = driver.page_source
             soup = BeautifulSoup(html_content, 'html.parser')
@@ -107,6 +106,15 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
             
             for anuncio in anuncios:
                 try:
+                    link_tag = anuncio.find('a', href=True)
+                    if not link_tag: continue
+                    link = "https://swappa.com" + link_tag['href']
+
+                    # --- VALIDACIÓN ANTI-DUPLICADOS ---
+                    if link in processed_links:
+                        continue # Si ya procesamos este link, lo saltamos
+                    processed_links.add(link)
+
                     precio_tag = anuncio.find('span', itemprop='price')
                     if not precio_tag: continue
                     precio = float(precio_tag.text.strip())
@@ -118,7 +126,6 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                     vendedor_tag = anuncio.find('span', itemprop='name')
                     vendedor = vendedor_tag.text.strip() if vendedor_tag else "N/A"
                     
-                    # --- LÓGICA DE EXTRACCIÓN DEFINITIVA ---
                     color = "N/A"
                     almacenamiento = "N/A"
                     
@@ -155,9 +162,6 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                         cumple_bateria = bateria >= min_battery
                     else:
                         cumple_bateria = True
-                    
-                    link_tag = anuncio.find('a', href=True)
-                    link = "https://swappa.com" + link_tag['href'] if link_tag else "Enlace no encontrado"
 
                     if precio < max_price and estado.lower() == desired_condition.lower() and cumple_bateria:
                         all_found_devices.append({
@@ -264,9 +268,9 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resultado_inicial = await asyncio.to_thread(scrape_swappa, url, max_price_f, condition, min_battery_i, device_name)
 
         if resultado_inicial and "Error" not in resultado_inicial:
-            await update.message.reply_html(resultado_inicial)
+            await update.message.reply_html(resultado_inicial, disable_web_page_preview=True)
         elif "Error" in (resultado_inicial or ""):
-            await update.message.reply_html(resultado_inicial)
+            await update.message.reply_html(resultado_inicial, disable_web_page_preview=True)
         else:
             await update.message.reply_text("😥 Búsqueda inicial completada. No se encontraron ofertas que cumplan tus criterios.")
 
@@ -347,7 +351,7 @@ async def run_scheduler_check():
         freq_seconds = r.get('frequency_seconds', r.get('frequency_hours', 1) * 3600)
         if current_time - r['last_checked'] > freq_seconds:
             logger.info(f"Ejecutando recordatorio: {r['reminder_id']}")
-            resultado = scrape_swappa(r["url"], r["max_price"], r["condition"], r["min_battery"], r.get("device_name", "Producto"))
+            resultado = await asyncio.to_thread(scrape_swappa, r["url"], r["max_price"], r["condition"], r["min_battery"], r.get("device_name", "Producto"))
             
             conn_update = db_connect()
             with conn_update.cursor() as cur_update:
@@ -356,7 +360,7 @@ async def run_scheduler_check():
             conn_update.close()
 
             if resultado and "Error" not in resultado:
-                await bot_app.bot.send_message(chat_id=r["chat_id"], text=resultado, parse_mode='HTML')
+                await bot_app.bot.send_message(chat_id=r["chat_id"], text=resultado, parse_mode='HTML', disable_web_page_preview=True)
     logger.info("Revisión de recordatorios completada.")
 
 def run_bot_polling():
