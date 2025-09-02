@@ -80,7 +80,9 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
         options.add_argument('--headless')
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        driver = uc.Chrome(options=options)
+        
+        # Forzamos la versión del driver para máxima compatibilidad en Heroku
+        driver = uc.Chrome(options=options, version_main=139)
         
         # --- BUCLE PARA REVISAR LAS PRIMERAS 3 PÁGINAS ---
         for page_num in range(1, 4):
@@ -186,7 +188,8 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
             return None
     except Exception as e:
         logger.error(f"Error durante el scraping: {e}")
-        return f"⚠️ <b>Error en la búsqueda para {device_name}:</b>\n<pre>{e}</pre>"
+        error_message = str(e).split('Stacktrace:')[0].strip()
+        return f"⚠️ <b>Error en la búsqueda para {device_name}:</b>\n<pre>No se pudo iniciar el navegador. Es probable que sea un problema temporal en el servidor.\n\nDetalle: {error_message}</pre>"
     finally:
         if driver: driver.quit()
 
@@ -361,6 +364,9 @@ async def run_scheduler_check():
 
             if resultado and "Error" not in resultado:
                 await bot_app.bot.send_message(chat_id=r["chat_id"], text=resultado, parse_mode='HTML', disable_web_page_preview=True)
+            elif "Error" in (resultado or ""):
+                 await bot_app.bot.send_message(chat_id=r["chat_id"], text=resultado, parse_mode='HTML', disable_web_page_preview=True)
+
     logger.info("Revisión de recordatorios completada.")
 
 def run_bot_polling():
