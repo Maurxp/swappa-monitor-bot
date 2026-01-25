@@ -5,7 +5,7 @@ import time
 import asyncio
 import sys
 import psycopg2
-import requests
+import requests # Usaremos requests para obtener el nombre del producto rápidamente
 from psycopg2.extras import RealDictCursor
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -33,6 +33,7 @@ def db_connect():
 def setup_database():
     conn = db_connect()
     with conn.cursor() as cur:
+        # Añadimos la columna device_name para identificar los recordatorios
         cur.execute("""
             CREATE TABLE IF NOT EXISTS reminders (
                 id SERIAL PRIMARY KEY,
@@ -47,55 +48,56 @@ def setup_database():
                 device_name TEXT
             );
         """)
+        # Asegurarnos de que la columna existe si la tabla ya fue creada
         try:
             cur.execute("ALTER TABLE reminders ADD COLUMN IF NOT EXISTS device_name TEXT;")
         except Exception:
-            conn.rollback()
+            conn.rollback() # Si falla (ya existe), hacemos rollback silencioso
         conn.commit()
     conn.close()
 
-# --- Obtener el Nombre del Producto (Headers Mejorados) ---
+# --- Nueva Función para Obtener el Nombre del Producto (CORREGIDA) ---
 def get_device_name(url: str):
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9'
-        }
-        page = requests.get(url, headers=headers, timeout=10)
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        page = requests.get(url, headers=headers)
         page.raise_for_status()
         soup = BeautifulSoup(page.content, 'html.parser')
         
-        title_selectors = ['h1 span', 'h1', '.product_title', 'title']
-        for selector in title_selectors:
-            name_tag = soup.select_one(selector)
-            if name_tag:
-                # Limpieza básica del título
-                return name_tag.text.strip().replace(' on Swappa', '')
-        
-        return "Producto Swappa"
+        # Lógica solicitada: Buscar dentro del enlace de breadcrumb o título específico
+        # <a href="/listings/..." title="Buy iPhone 13">iPhone 13</a>
+        name_link = soup.find('a', href=re.compile(r'^/listings/'), title=re.compile(r'^Buy '))
+        if name_link:
+            return name_link.get_text(strip=True)
+            
+        # Fallback al h1 si falla lo anterior
+        h1 = soup.find('h1')
+        if h1:
+            return h1.get_text(strip=True).replace(' on Swappa', '')
+            
+        return "Producto Desconocido"
     except Exception as e:
         logger.error(f"No se pudo obtener el nombre del dispositivo de {url}: {e}")
-        return "Producto Swappa"
+        return "Producto Desconocido"
 
-# --- Lógica de Scraping EXACTA ---
+# --- Lógica de Scraping con Paginación y Anti-Duplicados (ACTUALIZADA) ---
 def scrape_swappa(url: str, max_price: float, desired_condition: str, min_battery: int, device_name: str):
-    logger.info(f"Iniciando búsqueda para {device_name}...")
+    logger.info(f"Iniciando búsqueda para {device_name} en URL base: {url}")
     driver = None
     all_found_devices = []
-    processed_links = set() 
-    
+    processed_links = set() # Usamos un set para guardar los links ya procesados y evitar duplicados
     try:
         options = uc.ChromeOptions()
         options.add_argument('--headless')
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--window-size=1920,1080") # Importante para que se vea el layout completo
         
+        # Forzamos la versión del driver para máxima compatibilidad en Heroku
         driver = uc.Chrome(options=options)
         
-        # --- BUCLE PÁGINAS ---
-        for page_num in range(1, 4): 
+        # --- BUCLE PARA REVISAR LAS PRIMERAS 3 PÁGINAS ---
+        for page_num in range(1, 4):
             if page_num == 1:
                 page_url = url
             else:
@@ -107,276 +109,344 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
             
             try:
                 wait = WebDriverWait(driver, 15)
+                # Esperamos la nueva clase de tarjeta
                 wait.until(EC.presence_of_element_located((By.CLASS_NAME, "xui_card_listing")))
             except Exception:
-                logger.warning(f"No se detectaron tarjetas 'xui_card_listing' en pág {page_num} o timeout.")
-                if page_num > 1: break
+                logger.info(f"No se encontraron anuncios en la página {page_num} o la página no existe. Terminando búsqueda.")
+                break
 
             html_content = driver.page_source
             soup = BeautifulSoup(html_content, 'html.parser')
             
-            # --- PARSING QUIRÚRGICO ---
-            listings = soup.find_all("div", class_="xui_card_listing")
+            # Buscamos los contenedores nuevos
+            anuncios = soup.find_all("div", class_="xui_card_listing")
             
             found_on_page = 0
             
-            for card in listings:
+            for anuncio in anuncios:
                 try:
-                    # 1. PRECIO
-                    price_span = card.find("span", itemprop="price")
-                    if not price_span: continue
+                    # 1. LINK
+                    link_tag = anuncio.find('a', href=re.compile(r'/listing/view/'))
+                    if not link_tag: 
+                        # Intento secundario dentro de precio
+                        price_div = anuncio.find("div", class_="price")
+                        if price_div: link_tag = price_div.find("a", href=True)
                     
-                    price_text = price_span.get_text(strip=True).replace(',', '')
-                    if not price_text: continue
-                    precio = float(price_text)
-
-                    # 2. LINK
-                    link_tag = None
-                    price_div = card.find("div", class_="price")
-                    if price_div:
-                        link_tag = price_div.find("a", href=True)
-                    
-                    if not link_tag:
-                         link_tag = card.find("a", href=re.compile(r'/listing/view/'))
-
                     if not link_tag: continue
                     
                     href = link_tag['href']
-                    link = f"https://swappa.com{href}" if not href.startswith('http') else href
-                    if link in processed_links: continue
+                    link = "https://swappa.com" + href if not href.startswith("http") else href
 
-                    # 3. VENDEDOR
-                    seller_div = card.find("div", class_="seller_name")
-                    vendedor = seller_div.get_text(strip=True) if seller_div else "Vendedor"
+                    # --- VALIDACIÓN ANTI-DUPLICADOS ---
+                    if link in processed_links:
+                        continue 
+                    processed_links.add(link)
 
-                    # 4. ATRIBUTOS
-                    condicion_actual = "N/A"
-                    bateria_actual = 0
-                    info_extra = []
+                    # 2. PRECIO
+                    precio_tag = anuncio.find('span', itemprop='price')
+                    if not precio_tag: continue
+                    precio = float(precio_tag.text.strip().replace(',', ''))
                     
-                    attrs_div = card.find("div", class_="attrs")
+                    # 3. VENDEDOR
+                    vendedor_tag = anuncio.find('div', class_='seller_name')
+                    vendedor = vendedor_tag.text.strip() if vendedor_tag else "N/A"
+                    
+                    # 4. ATRIBUTOS (Condición, Bat, Color, Alm)
+                    # Valores por defecto
+                    estado = "N/A"
+                    bateria = 0
+                    color = "N/A"
+                    almacenamiento = "N/A"
+                    
+                    attrs_div = anuncio.find("div", class_="attrs")
                     if attrs_div:
-                        # A. Batería
+                        # Batería
                         batt_span = attrs_div.find("span", class_="color_battery")
                         if batt_span:
                             batt_text = batt_span.get_text(strip=True)
-                            batt_match = re.search(r'(\d+)%', batt_text)
-                            if batt_match:
-                                bateria_actual = int(batt_match.group(1))
+                            match = re.search(r'(\d+)%', batt_text)
+                            if match: bateria = int(match.group(1))
                         
-                        # B. Resto de atributos
+                        # Otros atributos
                         all_attrs = attrs_div.find_all("span", class_="attr")
-                        known_conditions = ["mint", "good", "fair", "new", "open box"]
-                        
                         for attr in all_attrs:
                             if "color_battery" in attr.get("class", []): continue
+                            txt = attr.get_text(" ", strip=True).strip()
+                            txt_lower = txt.lower()
                             
-                            txt = attr.get_text(" ", strip=True).lower()
-                            
-                            is_condition = False
-                            for cond in known_conditions:
-                                if cond == txt:
-                                    condicion_actual = txt.title()
-                                    is_condition = True
-                                    break
-                            
-                            if not is_condition and "warranty" not in txt:
-                                clean_txt = txt.strip()
-                                if clean_txt: info_extra.append(clean_txt.title())
+                            if txt_lower in ["mint", "good", "fair", "new", "open box"]:
+                                estado = txt # Guardamos con mayúsculas originales
+                            elif "gb" in txt_lower or "tb" in txt_lower:
+                                almacenamiento = txt
+                            elif "warranty" not in txt_lower:
+                                # Asumimos que si no es condición ni memoria ni garantía, es color/unlocked
+                                color = txt
 
-                    if condicion_actual == "N/A":
-                        full_text = card.get_text(" ", strip=True).lower()
-                        if "mint" in full_text: condicion_actual = "Mint"
-                        elif "good" in full_text: condicion_actual = "Good"
-                        elif "fair" in full_text: condicion_actual = "Fair"
+                    # Fallback estado si no estaba en attrs
+                    if estado == "N/A":
+                        full_txt = anuncio.get_text(" ", strip=True).lower()
+                        if "mint" in full_txt: estado = "Mint"
+                        elif "good" in full_txt: estado = "Good"
+                        elif "fair" in full_txt: estado = "Fair"
 
                     # --- FILTROS ---
-                    if precio > max_price: continue
-
-                    if desired_condition.lower() not in condicion_actual.lower():
-                        continue
-
-                    if min_battery > 0:
-                        if bateria_actual > 0 and bateria_actual < min_battery:
-                            continue
-
-                    processed_links.add(link)
                     
-                    all_found_devices.append({
-                        "precio": precio,
-                        "estado": condicion_actual,
-                        "bateria": bateria_actual,
-                        "link": link,
-                        "vendedor": vendedor,
-                        "info": ", ".join(info_extra)
-                    })
-                    found_on_page += 1
-                        
-                except Exception as e:
-                    logger.error(f"Error parseando tarjeta: {e}")
+                    # Filtro Batería
+                    cumple_bateria = False
+                    if min_battery > 0:
+                        if bateria > 0:
+                            cumple_bateria = bateria >= min_battery
+                        else:
+                            # Si no tiene dato, lo dejamos pasar (política permisiva)
+                            cumple_bateria = True 
+                    else:
+                        cumple_bateria = True
+
+                    # Filtro Precio (<=) y Condición
+                    # Normalizamos condición para comparar
+                    cond_match = desired_condition.lower() in estado.lower()
+                    
+                    if precio <= max_price and cond_match and cumple_bateria:
+                        all_found_devices.append({
+                            "precio": precio, 
+                            "estado": estado, 
+                            "bateria": bateria, 
+                            "link": link,
+                            "vendedor": vendedor, 
+                            "color": color, 
+                            "almacenamiento": almacenamiento
+                        })
+                        found_on_page += 1
+
+                except (ValueError, AttributeError, IndexError) as e: 
                     continue
             
             if found_on_page == 0 and page_num > 1:
                 break
         
-        # --- GENERAR RESPUESTA ---
         if all_found_devices:
+            # Ordenamos por precio
             all_found_devices.sort(key=lambda x: x['precio'])
-            msg = f"<b>🔔 ¡Swappa Bot! {len(all_found_devices)} ofertas para {device_name}:</b>\n\n"
             
-            for d in all_found_devices[:10]:
-                batt_icon = "🔋" if d['bateria'] > 0 else "❓"
-                batt_str = f"{d['bateria']}%" if d['bateria'] > 0 else "N/A"
-                
-                msg += f"📱 <b>${d['precio']}</b> | {d['estado']}\n"
-                msg += f"   {batt_icon} Bat: {batt_str} | {d['info']}\n"
-                msg += f"   👤 {d['vendedor']}\n"
-                msg += f"   🔗 <a href='{d['link']}'>Ver Oferta</a>\n\n"
-            
-            return msg
-        return None
-
+            mensaje_final = f"<b>🔔 ¡Alerta de Swappa! Se encontraron {len(all_found_devices)} ofertas de {device_name}:</b>\n\n"
+            for dispositivo in all_found_devices:
+                mensaje_final += f"📱 <b>Precio: ${dispositivo['precio']}</b>\n"
+                mensaje_final += f"   - Estado: {dispositivo['estado']}\n"
+                if min_battery > 0:
+                    # Lógica para mostrar N/A si es 0, o el número si existe
+                    bat_val = f"{dispositivo['bateria']}%" if dispositivo['bateria'] > 0 else "N/A"
+                    mensaje_final += f"   - Batería: {bat_val}\n"
+                mensaje_final += f"   - Almacenamiento: {dispositivo['almacenamiento']}\n"
+                mensaje_final += f"   - Color: {dispositivo['color']}\n"
+                mensaje_final += f"   - Vendedor: {dispositivo['vendedor']}\n"
+                mensaje_final += f"   - <a href='{dispositivo['link']}'>Ver Anuncio</a>\n\n"
+            return mensaje_final
+        else:
+            return None
     except Exception as e:
-        logger.error(f"Error scraping general: {e}")
-        return None
+        logger.error(f"Error durante el scraping: {e}")
+        error_message = str(e).split('Stacktrace:')[0].strip()
+        return f"⚠️ <b>Error en la búsqueda para {device_name}:</b>\n<pre>No se pudo iniciar el navegador. Es probable que sea un problema temporal en el servidor.\n\nDetalle: {error_message}</pre>"
     finally:
-        if driver: 
-            try: driver.quit()
-            except: pass
+        if driver: driver.quit()
 
-# --- Comandos del Bot ---
+# --- Comandos del Bot de Telegram ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
-        "👋 <b>Swappa Bot Reparado</b>\n\n"
-        "Comando:\n<code>/remind [URL] [PRECIO] [CONDICION] [BAT] [TIEMPO]</code>\n\n"
-        "Ejemplo:\n<code>/remind https://swappa.com/listings/iphone-13 350 Mint 90 30m</code>"
+        "¡Hola! Soy tu bot de monitoreo de precios para Swappa💚.\n\n"
+        "<b>Comandos disponibles:</b>\n"
+        "/remind - Configura una nueva alerta y busca de inmediato.\n"
+        "/myreminders - Muestra tus alertas activas.\n"
+        "/stopreminder - Elimina una alerta.\n"
+        "/help - Muestra las instrucciones detalladas.\n\n"
+        "<i>Hecho con mucho ❤ por @devmauro</i>"
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
-        "<b>Ayuda:</b>\n"
-        "1. Ve a Swappa y copia el link del producto.\n"
-        "2. Usa /remind con tus filtros.\n"
-        "3. Usa /myreminders para ver qué estás buscando.\n"
-        "4. Usa /stopreminder [ID] para borrar."
+        "<b>✨ Instrucciones para /remind:</b>\n\n"
+        "Debes proporcionar 5 parámetros:\n"
+        "1. URL de Swappa\n"
+        "2. Precio máximo\n"
+        "3. Condición (Good, Mint, New, Fair, Used, etc.)\n"
+        "4. Batería mínima (<b>Usa 0 si no quieres filtrar por batería</b>)\n"
+        "5. Frecuencia (ej. <b>30m</b> para 30 minutos, <b>2h</b> para 2 horas)\n\n"
+        "<b>Ejemplo (cada 2 horas):</b>\n"
+        "/remind https://swappa.com/listings/apple-iphone-15 700 Good 90 2h\n\n"
+        "<b>Ejemplo (cada 45 minutos):</b>\n"
+        "/remind https://swappa.com/listings/google-pixel-8 400 Good 0 45m\n\n"
+        "<b>Recuerda el formato:</b>\n"
+        "/remind [url_swappa] [precio_max] [condicion] [bateria] [tiempo]"
     )
 
 async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.message.chat_id)
     args = context.args
     if len(args) != 5:
-        await update.message.reply_text("❌ Faltan datos. Ejemplo: /remind [link] 300 Good 85 1h")
+        await update.message.reply_html("⚠️ <b>Formato incorrecto.</b> Necesito 5 parámetros. Usa /help.")
         return
-
-    url, price, cond, batt, freq = args
-    
     try:
-        num = int(re.search(r'\d+', freq).group())
-        unit = re.search(r'[a-zA-Z]', freq).group().lower()
-        seconds = num * 3600 if 'h' in unit else num * 60
-        
+        url, max_price, condition, min_battery, frequency_str = args
+        await update.message.reply_text("🤖 Obteniendo información del producto...")
         device_name = await asyncio.to_thread(get_device_name, url)
-        rid = f"rem_{chat_id}_{int(time.time())}"
+
+        max_price_f = float(max_price)
+        min_battery_i = int(min_battery)
+        
+        time_value = int(re.findall(r'\d+', frequency_str)[0])
+        time_unit = re.findall(r'[a-zA-Z]+', frequency_str)[0].lower()
+
+        if time_unit == 'h':
+            frequency_seconds = time_value * 3600
+            display_freq = f"{time_value} horas"
+        elif time_unit == 'm':
+            frequency_seconds = time_value * 60
+            display_freq = f"{time_value} minutos"
+        else:
+            await update.message.reply_html("⚠️ <b>Unidad de tiempo inválida.</b> Usa 'h' para horas o 'm' para minutos.")
+            return
+
+        reminder_id = f"reminder_{chat_id}_{int(time.time())}"
         
         conn = db_connect()
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO reminders (chat_id, reminder_id, url, max_price, condition, min_battery, frequency_seconds, last_checked, device_name) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (chat_id, rid, url, float(price), cond, int(batt), seconds, int(time.time()), device_name)
+                """
+                INSERT INTO reminders (chat_id, reminder_id, url, max_price, condition, min_battery, frequency_seconds, last_checked, device_name)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (chat_id, reminder_id, url, max_price_f, condition, min_battery_i, frequency_seconds, int(time.time()), device_name)
             )
             conn.commit()
         conn.close()
         
-        await update.message.reply_html(f"✅ Alerta creada para <b>{device_name}</b>.\nBuscando...")
+        await update.message.reply_html(
+            f"✅ <b>Recordatorio configurado para {device_name}.</b> Se buscará cada {display_freq}.\n\n"
+            f"<i>Realizando la primera búsqueda en las 3 primeras páginas...</i> 🔍"
+        )
         
-        res = await asyncio.to_thread(scrape_swappa, url, float(price), cond, int(batt), device_name)
-        if res:
-            await update.message.reply_html(res, disable_web_page_preview=True)
+        resultado_inicial = await asyncio.to_thread(scrape_swappa, url, max_price_f, condition, min_battery_i, device_name)
+
+        if resultado_inicial and "Error" not in resultado_inicial:
+            await update.message.reply_html(resultado_inicial, disable_web_page_preview=True)
+        elif "Error" in (resultado_inicial or ""):
+            await update.message.reply_html(resultado_inicial, disable_web_page_preview=True)
         else:
-            await update.message.reply_text("🔎 No encontré nada ahora, pero seguiré buscando automáticamente.")
-            
+            await update.message.reply_text("😥 Búsqueda inicial completada. No se encontraron ofertas que cumplan tus criterios.")
+
+    except (ValueError, IndexError):
+        await update.message.reply_html("⚠️ <b>Parámetros incorrectos.</b> Revisa el formato y usa /help.")
     except Exception as e:
-        logger.error(e)
-        await update.message.reply_text("❌ Error. Verifica el formato (ej. precio sin signos de dolar).")
+        logger.error(f"Error en /remind: {e}")
+        await update.message.reply_html("❌ Hubo un error al guardar tu recordatorio.")
 
 async def my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.message.chat_id)
     conn = db_connect()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT * FROM reminders WHERE chat_id = %s", (str(update.message.chat_id),))
-        rows = cur.fetchall()
+        cur.execute("SELECT * FROM reminders WHERE chat_id = %s", (chat_id,))
+        user_reminders = cur.fetchall()
     conn.close()
-    
-    if not rows:
-        await update.message.reply_text("📭 Sin alertas.")
-        return
 
-    msg = "<b>Tus Alertas:</b>\n\n"
-    for r in rows:
-        # CORREGIDO: Eliminados caracteres < y > que rompen el HTML de Telegram
-        # También escapamos el nombre por seguridad
-        safe_name = str(r['device_name']).replace('<', '').replace('>', '')
-        
-        msg += f"🔹 <b>{safe_name}</b>\n"
-        msg += f"   Max: ${r['max_price']} | {r['condition']} | Bat: {r['min_battery']}%\n"
-        msg += f"   ID: <code>{r['reminder_id']}</code>\n\n"
+    if not user_reminders:
+        await update.message.reply_text("‼ No tienes ningún recordatorio activo.")
+        return
     
-    # Enviamos el mensaje corregido
-    await update.message.reply_html(msg)
+    message = "<b>📍 Tus recordatorios activos:</b>\n"
+    for r in user_reminders:
+        bateria_info = f"{r['min_battery']}%" if r['min_battery'] > 0 else "No Aplica"
+        freq_seconds = r.get('frequency_seconds')
+        if freq_seconds >= 3600:
+            display_freq = f"Cada {freq_seconds // 3600} horas"
+        else:
+            display_freq = f"Cada {freq_seconds // 60} minutos"
+
+        message += "----------------------------------\n"
+        message += f"📱 <b>{r.get('device_name', 'Producto Desconocido')}</b>\n"
+        message += f"🆔 <b>ID:</b> <code>{r['reminder_id']}</code>\n"
+        message += f"💰 <b>Precio Máx:</b> ${r['max_price']}\n"
+        message += f"✨ <b>Condición:</b> {r['condition']}\n"
+        message += f"🔋 <b>Batería Mín:</b> {bateria_info}\n"
+        message += f"⏰ <b>Frecuencia:</b> {display_freq}\n"
+    
+    message += "----------------------------------\n\n"
+    message += "‼ Para eliminar un recordatorio, usa /stopreminder [ID]"
+    await update.message.reply_html(message, disable_web_page_preview=True)
 
 async def stop_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Dime el ID (usa /myreminders).")
+    chat_id = str(update.message.chat_id)
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Por favor, proporciona el ID del recordatorio.")
         return
     
+    reminder_id_to_delete = context.args[0]
     conn = db_connect()
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM reminders WHERE reminder_id = %s AND chat_id = %s", (context.args[0], str(update.message.chat_id)))
-        cnt = cur.rowcount
+        cur.execute(
+            "DELETE FROM reminders WHERE reminder_id = %s AND chat_id = %s",
+            (reminder_id_to_delete, chat_id)
+        )
+        deleted_count = cur.rowcount
         conn.commit()
     conn.close()
-    
-    await update.message.reply_text("✅ Borrado." if cnt > 0 else "❌ ID incorrecto.")
 
-# --- Scheduler ---
+    if deleted_count > 0:
+        await update.message.reply_text(f"✅ Recordatorio {reminder_id_to_delete} eliminado.")
+    else:
+        await update.message.reply_text("❌ No se encontró un recordatorio con ese ID o no te pertenece.")
+
+# --- Funciones de Ejecución ---
 async def run_scheduler_check():
+    logger.info("Iniciando revisión de todos los recordatorios...")
     conn = db_connect()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT * FROM reminders")
-        rows = cur.fetchall()
+        reminders = cur.fetchall()
     conn.close()
     
-    bot = Application.builder().token(TELEGRAM_TOKEN).build().bot
-    now = int(time.time())
-    
-    for r in rows:
-        if now - r['last_checked'] > r['frequency_seconds']:
-            logger.info(f"Check auto: {r['device_name']}")
-            res = await asyncio.to_thread(scrape_swappa, r['url'], r['max_price'], r['condition'], r['min_battery'], r['device_name'])
+    current_time = int(time.time())
+    bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    for r in reminders:
+        freq_seconds = r.get('frequency_seconds', r.get('frequency_hours', 1) * 3600)
+        if current_time - r['last_checked'] > freq_seconds:
+            logger.info(f"Ejecutando recordatorio: {r['reminder_id']}")
+            resultado = await asyncio.to_thread(scrape_swappa, r["url"], r["max_price"], r["condition"], r["min_battery"], r.get("device_name", "Producto"))
             
-            c2 = db_connect()
-            with c2.cursor() as cur2:
-                cur2.execute("UPDATE reminders SET last_checked = %s WHERE id = %s", (now, r['id']))
-                c2.commit()
-            c2.close()
-            
-            if res:
-                try:
-                    await bot.send_message(chat_id=r['chat_id'], text=res, parse_mode='HTML', disable_web_page_preview=True)
-                except Exception as e:
-                    logger.error(f"Error enviando a Telegram: {e}")
+            conn_update = db_connect()
+            with conn_update.cursor() as cur_update:
+                cur_update.execute("UPDATE reminders SET last_checked = %s WHERE id = %s", (current_time, r['id']))
+                conn_update.commit()
+            conn_update.close()
+
+            if resultado and "Error" not in resultado:
+                await bot_app.bot.send_message(chat_id=r["chat_id"], text=resultado, parse_mode='HTML', disable_web_page_preview=True)
+            elif "Error" in (resultado or ""):
+                 await bot_app.bot.send_message(chat_id=r["chat_id"], text=resultado, parse_mode='HTML', disable_web_page_preview=True)
+
+    logger.info("Revisión de recordatorios completada.")
 
 def run_bot_polling():
+    if not DATABASE_URL or not TELEGRAM_TOKEN:
+        logger.error("Faltan variables de entorno.")
+        return
     setup_database()
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("remind", remind))
-    app.add_handler(CommandHandler("myreminders", my_reminders))
-    app.add_handler(CommandHandler("stopreminder", stop_reminder))
-    app.run_polling()
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("remind", remind))
+    application.add_handler(CommandHandler("myreminders", my_reminders))
+    application.add_handler(CommandHandler("stopreminder", stop_reminder))
+    
+    logger.info("Iniciando el bot en modo polling...")
+    application.run_polling()
 
 if __name__ == '__main__':
-    if len(sys.argv) > 1 and sys.argv[1] == 'run_scheduler_check':
-        asyncio.run(run_scheduler_check())
+    if len(sys.argv) > 1:
+        if sys.argv[1] == 'run_bot_polling':
+            run_bot_polling()
+        elif sys.argv[1] == 'run_scheduler_check':
+            asyncio.run(run_scheduler_check())
     else:
-        run_bot_polling()
+        print("Uso: python main.py [run_bot_polling|run_scheduler_check]")
