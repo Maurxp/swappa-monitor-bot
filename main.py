@@ -97,7 +97,7 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
 
-        driver = uc.Chrome(options=options, version_main=139)
+        driver = uc.Chrome(options=options)
 
         for page_num in range(1, 4):
             if page_num == 1:
@@ -413,3 +413,4 @@ if __name__ == '__main__':
             asyncio.run(run_scheduler_check())
     else:
         print("Uso: python main.py [run_bot_polling|run_scheduler_check]")
+
