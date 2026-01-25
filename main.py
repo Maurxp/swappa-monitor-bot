@@ -47,7 +47,6 @@ def setup_database():
                 device_name TEXT
             );
         """)
-        # Migración segura por si la columna ya existe en tu DB actual
         try:
             cur.execute("ALTER TABLE reminders ADD COLUMN IF NOT EXISTS device_name TEXT;")
         except Exception:
@@ -66,11 +65,11 @@ def get_device_name(url: str):
         page.raise_for_status()
         soup = BeautifulSoup(page.content, 'html.parser')
         
-        # Selectores para el título principal
         title_selectors = ['h1 span', 'h1', '.product_title', 'title']
         for selector in title_selectors:
             name_tag = soup.select_one(selector)
             if name_tag:
+                # Limpieza básica del título
                 return name_tag.text.strip().replace(' on Swappa', '')
         
         return "Producto Swappa"
@@ -78,7 +77,7 @@ def get_device_name(url: str):
         logger.error(f"No se pudo obtener el nombre del dispositivo de {url}: {e}")
         return "Producto Swappa"
 
-# --- Lógica de Scraping EXACTA (Basada en tus snippets HTML) ---
+# --- Lógica de Scraping EXACTA ---
 def scrape_swappa(url: str, max_price: float, desired_condition: str, min_battery: int, device_name: str):
     logger.info(f"Iniciando búsqueda para {device_name}...")
     driver = None
@@ -95,7 +94,7 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
         
         driver = uc.Chrome(options=options)
         
-        # --- BUCLE PÁGINAS (Busca en las primeras 3 páginas) ---
+        # --- BUCLE PÁGINAS ---
         for page_num in range(1, 4): 
             if page_num == 1:
                 page_url = url
@@ -108,7 +107,6 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
             
             try:
                 wait = WebDriverWait(driver, 15)
-                # Esperamos a que cargue al menos una tarjeta de producto (xui_card_listing)
                 wait.until(EC.presence_of_element_located((By.CLASS_NAME, "xui_card_listing")))
             except Exception:
                 logger.warning(f"No se detectaron tarjetas 'xui_card_listing' en pág {page_num} o timeout.")
@@ -118,14 +116,13 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
             soup = BeautifulSoup(html_content, 'html.parser')
             
             # --- PARSING QUIRÚRGICO ---
-            # Buscamos cada tarjeta individualmente usando la clase contenedora que encontraste
             listings = soup.find_all("div", class_="xui_card_listing")
             
             found_on_page = 0
             
             for card in listings:
                 try:
-                    # 1. PRECIO (De tu snippet: <span itemprop="price">)
+                    # 1. PRECIO
                     price_span = card.find("span", itemprop="price")
                     if not price_span: continue
                     
@@ -133,15 +130,13 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                     if not price_text: continue
                     precio = float(price_text)
 
-                    # 2. LINK (Buscar enlace dentro de la clase .price o genérico)
-                    # Tu snippet: <div class="price ..."> <a href="...">
+                    # 2. LINK
                     link_tag = None
                     price_div = card.find("div", class_="price")
                     if price_div:
                         link_tag = price_div.find("a", href=True)
                     
                     if not link_tag:
-                         # Fallback: buscar cualquier link de vista de listing
                          link_tag = card.find("a", href=re.compile(r'/listing/view/'))
 
                     if not link_tag: continue
@@ -150,18 +145,18 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                     link = f"https://swappa.com{href}" if not href.startswith('http') else href
                     if link in processed_links: continue
 
-                    # 3. VENDEDOR (De tu snippet: <div class="seller_name" itemprop="name">)
+                    # 3. VENDEDOR
                     seller_div = card.find("div", class_="seller_name")
                     vendedor = seller_div.get_text(strip=True) if seller_div else "Vendedor"
 
-                    # 4. ATRIBUTOS (Condición, Batería, etc. en <div class="attrs">)
+                    # 4. ATRIBUTOS
                     condicion_actual = "N/A"
                     bateria_actual = 0
                     info_extra = []
                     
                     attrs_div = card.find("div", class_="attrs")
                     if attrs_div:
-                        # A. Batería (Clase específica .color_battery que encontraste)
+                        # A. Batería
                         batt_span = attrs_div.find("span", class_="color_battery")
                         if batt_span:
                             batt_text = batt_span.get_text(strip=True)
@@ -169,18 +164,15 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                             if batt_match:
                                 bateria_actual = int(batt_match.group(1))
                         
-                        # B. Resto de atributos (Condición, Almacenamiento, Color)
-                        # Iteramos los span.attr genéricos
+                        # B. Resto de atributos
                         all_attrs = attrs_div.find_all("span", class_="attr")
                         known_conditions = ["mint", "good", "fair", "new", "open box"]
                         
                         for attr in all_attrs:
-                            # Ignoramos el de batería que ya procesamos para no duplicar
                             if "color_battery" in attr.get("class", []): continue
                             
                             txt = attr.get_text(" ", strip=True).lower()
                             
-                            # Detectar Condición
                             is_condition = False
                             for cond in known_conditions:
                                 if cond == txt:
@@ -188,12 +180,10 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                                     is_condition = True
                                     break
                             
-                            # Si no es condición ni garantía, guardar como info extra (Color, GB, Unlocked)
                             if not is_condition and "warranty" not in txt:
                                 clean_txt = txt.strip()
                                 if clean_txt: info_extra.append(clean_txt.title())
 
-                    # Fallback de condición si no estaba en .attrs (raro)
                     if condicion_actual == "N/A":
                         full_text = card.get_text(" ", strip=True).lower()
                         if "mint" in full_text: condicion_actual = "Mint"
@@ -201,22 +191,14 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                         elif "fair" in full_text: condicion_actual = "Fair"
 
                     # --- FILTROS ---
-                    
-                    # Filtro Precio
                     if precio > max_price: continue
 
-                    # Filtro Condición
-                    # Permitimos coincidencia parcial (ej: "Mint" pasa si pides "Mint")
                     if desired_condition.lower() not in condicion_actual.lower():
                         continue
 
-                    # Filtro Batería
                     if min_battery > 0:
-                        # Si encontramos batería y es menor a la deseada -> RECHAZAR
                         if bateria_actual > 0 and bateria_actual < min_battery:
                             continue
-                        # Si NO encontramos batería (bateria_actual == 0) -> LA ACEPTAMOS
-                        # (para no perder ofertas donde el vendedor olvidó ponerlo o es vendedor tienda)
 
                     processed_links.add(link)
                     
@@ -242,7 +224,7 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
             all_found_devices.sort(key=lambda x: x['precio'])
             msg = f"<b>🔔 ¡Swappa Bot! {len(all_found_devices)} ofertas para {device_name}:</b>\n\n"
             
-            for d in all_found_devices[:10]: # Top 10
+            for d in all_found_devices[:10]:
                 batt_icon = "🔋" if d['bateria'] > 0 else "❓"
                 batt_str = f"{d['bateria']}%" if d['bateria'] > 0 else "N/A"
                 
@@ -289,7 +271,6 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url, price, cond, batt, freq = args
     
     try:
-        # Calcular segundos
         num = int(re.search(r'\d+', freq).group())
         unit = re.search(r'[a-zA-Z]', freq).group().lower()
         seconds = num * 3600 if 'h' in unit else num * 60
@@ -308,7 +289,6 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_html(f"✅ Alerta creada para <b>{device_name}</b>.\nBuscando...")
         
-        # Búsqueda inicial
         res = await asyncio.to_thread(scrape_swappa, url, float(price), cond, int(batt), device_name)
         if res:
             await update.message.reply_html(res, disable_web_page_preview=True)
@@ -332,10 +312,15 @@ async def my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = "<b>Tus Alertas:</b>\n\n"
     for r in rows:
-        msg += f"🔹 <b>{r['device_name']}</b>\n"
-        msg += f"   < ${r['max_price']} | {r['condition']} | Bat >{r['min_battery']}%\n"
+        # CORREGIDO: Eliminados caracteres < y > que rompen el HTML de Telegram
+        # También escapamos el nombre por seguridad
+        safe_name = str(r['device_name']).replace('<', '').replace('>', '')
+        
+        msg += f"🔹 <b>{safe_name}</b>\n"
+        msg += f"   Max: ${r['max_price']} | {r['condition']} | Bat: {r['min_battery']}%\n"
         msg += f"   ID: <code>{r['reminder_id']}</code>\n\n"
     
+    # Enviamos el mensaje corregido
     await update.message.reply_html(msg)
 
 async def stop_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -352,7 +337,7 @@ async def stop_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("✅ Borrado." if cnt > 0 else "❌ ID incorrecto.")
 
-# --- Scheduler (para ejecutar con Heroku Scheduler) ---
+# --- Scheduler ---
 async def run_scheduler_check():
     conn = db_connect()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -380,7 +365,6 @@ async def run_scheduler_check():
                 except Exception as e:
                     logger.error(f"Error enviando a Telegram: {e}")
 
-# --- Bot Polling (para correr como web/worker) ---
 def run_bot_polling():
     setup_database()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -392,7 +376,6 @@ def run_bot_polling():
     app.run_polling()
 
 if __name__ == '__main__':
-    # Permite ejecutar el chequeo programado desde consola (Heroku Scheduler)
     if len(sys.argv) > 1 and sys.argv[1] == 'run_scheduler_check':
         asyncio.run(run_scheduler_check())
     else:
