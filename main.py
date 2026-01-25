@@ -55,7 +55,7 @@ def setup_database():
         conn.commit()
     conn.close()
 
-# --- Nueva Función para Obtener el Nombre del Producto ---
+# --- Obtener el Nombre del Producto ---
 def get_device_name(url: str):
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
@@ -63,12 +63,12 @@ def get_device_name(url: str):
         page.raise_for_status()
         soup = BeautifulSoup(page.content, 'html.parser')
         
-        # Estrategia 1: Breadcrumb link
+        # Buscar enlace de breadcrumb específico para el modelo
         name_link = soup.find('a', href=re.compile(r'^/listings/'), title=re.compile(r'^Buy '))
         if name_link:
             return name_link.get_text(strip=True)
             
-        # Estrategia 2: H1
+        # Fallback al h1
         h1 = soup.find('h1')
         if h1:
             return h1.get_text(strip=True).replace(' on Swappa', '')
@@ -80,7 +80,7 @@ def get_device_name(url: str):
 
 # --- Lógica de Scraping ESTRICTA ---
 def scrape_swappa(url: str, max_price: float, desired_condition: str, min_battery: int, device_name: str):
-    logger.info(f"Iniciando búsqueda ESTRICTA para {device_name} en: {url}")
+    logger.info(f"Iniciando búsqueda ESTRICTA para {device_name} en URL base: {url}")
     driver = None
     all_found_devices = []
     processed_links = set()
@@ -112,6 +112,7 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                 break
 
             soup = BeautifulSoup(driver.page_source, 'html.parser')
+            # Buscamos las tarjetas de producto nuevas
             anuncios = soup.find_all("div", class_="xui_card_listing")
             
             found_on_page = 0
@@ -120,7 +121,6 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                 try:
                     # 1. ENLACE
                     link_tag = anuncio.find('a', href=re.compile(r'/listing/view/'))
-                    # Fallback dentro de .price
                     if not link_tag:
                          price_div = anuncio.find("div", class_="price")
                          if price_div: link_tag = price_div.find("a", href=True)
@@ -129,6 +129,7 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                     
                     href = link_tag['href']
                     link = "https://swappa.com" + href if not href.startswith("http") else href
+                    
                     if link in processed_links: continue
                     processed_links.add(link)
 
@@ -141,7 +142,7 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                     vendedor_tag = anuncio.find('div', class_='seller_name')
                     vendedor = vendedor_tag.text.strip() if vendedor_tag else "N/A"
                     
-                    # 4. CONDICIÓN Y ATRIBUTOS (Lógica Estricta)
+                    # 4. CONDICIÓN Y ATRIBUTOS
                     estado = "N/A"
                     bateria = 0
                     color = "N/A"
@@ -149,13 +150,12 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                     
                     attrs_div = anuncio.find("div", class_="attrs")
                     if attrs_div:
-                        # A. Buscar Condición ESTRICTAMENTE usando el meta tag
-                        # <meta itemprop="itemCondition" ...> está dentro del span de la condición
+                        # A. Condición (Prioridad Meta Tag)
                         cond_meta = attrs_div.find("meta", itemprop="itemCondition")
                         if cond_meta and cond_meta.parent:
                             estado = cond_meta.parent.get_text(strip=True)
                         else:
-                            # Fallback menor: buscar texto exacto en spans
+                            # Fallback texto
                             for sp in attrs_div.find_all("span", class_="attr"):
                                 txt = sp.get_text(" ", strip=True)
                                 if txt in ["Mint", "Good", "Fair", "New", "Open Box"]:
@@ -169,55 +169,54 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                             match = re.search(r'(\d+)%', batt_text)
                             if match: bateria = int(match.group(1))
                         
-                        # C. Otros atributos
+                        # C. Almacenamiento y Color
                         for attr in attrs_div.find_all("span", class_="attr"):
-                            # Ignorar batería y condición ya encontrada
-                            txt = attr.get_text(" ", strip=True).strip()
                             if "color_battery" in attr.get("class", []): continue
-                            if txt == estado: continue 
-                            if "warranty" in txt.lower(): continue
-
-                            if "gb" in txt.lower() or "tb" in txt.lower():
+                            txt = attr.get_text(" ", strip=True).strip()
+                            txt_lower = txt.lower()
+                            
+                            # Ignorar lo que ya sabemos
+                            if txt == estado: continue
+                            if "warranty" in txt_lower: continue
+                            
+                            if "gb" in txt_lower or "tb" in txt_lower:
                                 almacenamiento = txt
+                            # Filtro para evitar que el Modelo o Unlocked se marque como Color
+                            elif "unlocked" in txt_lower:
+                                continue
+                            # Regex para detectar modelos (ej: A2482, SM-S908U) y ignorarlos
+                            elif re.search(r'^[a-z]{1,2}\d{3,4}', txt_lower) or re.search(r'^\d+$', txt_lower):
+                                continue
                             else:
+                                # Si sobra algo y no es nada de lo anterior, asumimos que es Color
                                 color = txt
-                    
-                    # Si después de esto estado sigue siendo N/A, DESCARTAMOS el producto.
-                    # NO usamos fallback de texto completo para evitar falsos positivos.
-                    if estado == "N/A": 
-                        continue
 
-                    # --- FILTRADO ---
+                    if estado == "N/A": continue
+
+                    # --- FILTRADO ESTRICTO ---
                     
-                    # 1. Filtro Precio (Estricto <=)
+                    # 1. Filtro Precio
                     if precio > max_price: continue
 
-                    # 2. Filtro Condición (Coincidencia parcial segura)
-                    # Ej: "Good" matchea "Good" (pero ya garantizamos que 'estado' viene de la etiqueta correcta)
-                    if desired_condition.lower() not in estado.lower():
-                        continue
+                    # 2. Filtro Condición
+                    if desired_condition.lower() not in estado.lower(): continue
                     
-                    # 3. Filtro Batería
-                    cumple_bateria = True
+                    # 3. Filtro Batería ESTRICTO
+                    # Si el usuario pide batería > 0, SOLO mostramos los que tienen batería >= X
                     if min_battery > 0:
-                        if bateria > 0:
-                            if bateria < min_battery: cumple_bateria = False
-                        else:
-                            # Si no hay dato de batería, la política permisiva lo acepta.
-                            # Si quisieras ser estricto (solo mostrar si TIENE dato y es > X), cambia a False.
-                            cumple_bateria = True 
+                        if bateria == 0: continue # No tiene info -> FUERA
+                        if bateria < min_battery: continue # Tiene info pero es baja -> FUERA
                     
-                    if cumple_bateria:
-                        all_found_devices.append({
-                            "precio": precio, 
-                            "estado": estado, 
-                            "bateria": bateria, 
-                            "link": link,
-                            "vendedor": vendedor, 
-                            "color": color, 
-                            "almacenamiento": almacenamiento
-                        })
-                        found_on_page += 1
+                    all_found_devices.append({
+                        "precio": precio, 
+                        "estado": estado, 
+                        "bateria": bateria, 
+                        "link": link,
+                        "vendedor": vendedor, 
+                        "color": color, 
+                        "almacenamiento": almacenamiento
+                    })
+                    found_on_page += 1
 
                 except (ValueError, AttributeError, IndexError):
                     continue
@@ -225,16 +224,13 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
             if found_on_page == 0 and page_num > 1:
                 break
         
-        # --- GENERACIÓN DE MENSAJE ---
+        # --- GENERACIÓN DE MENSAJE (Formato Original) ---
         if all_found_devices:
             all_found_devices.sort(key=lambda x: x['precio'])
             
-            # Guardamos el total real para informar
-            total_real = len(all_found_devices)
-            
-            # Recortamos la lista para envío seguro a Telegram (máx ~15 items)
-            # Esto previene el error "Message too long" si aparecen 50 resultados de repente.
+            # Limitamos a 15 para evitar errores de Telegram por mensaje largo
             items_to_show = all_found_devices[:15]
+            total_real = len(all_found_devices)
             
             mensaje_final = f"<b>🔔 ¡Alerta de Swappa! Se encontraron {total_real} ofertas de {device_name}:</b>\n\n"
             
@@ -244,7 +240,7 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                 mensaje_final += f"📱 <b>Precio: ${dispositivo['precio']}</b>\n"
                 mensaje_final += f"   - Estado: {dispositivo['estado']}\n"
                 if min_battery > 0:
-                    mensaje_final += f"   - Batería: {bat_val}\n"
+                     mensaje_final += f"   - Batería: {bat_val}\n"
                 mensaje_final += f"   - Almacenamiento: {dispositivo['almacenamiento']}\n"
                 mensaje_final += f"   - Color: {dispositivo['color']}\n"
                 mensaje_final += f"   - Vendedor: {dispositivo['vendedor']}\n"
