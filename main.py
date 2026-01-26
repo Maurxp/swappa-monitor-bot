@@ -238,7 +238,7 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                 bat_val = f"{dispositivo['bateria']}%" if dispositivo['bateria'] > 0 else "N/A"
                 
                 mensaje_final += f"📱 <b>Precio: ${dispositivo['precio']}</b>\n"
-                mensaje_final += f"   - Estado: {dispositivo['estado']}\n"
+                mensaje_final += f"   - Condición: {dispositivo['estado']}\n"
                 if min_battery > 0:
                      mensaje_final += f"   - Batería: {bat_val}\n"
                 mensaje_final += f"   - Almacenamiento: {dispositivo['almacenamiento']}\n"
@@ -264,19 +264,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "¡Hola! Soy tu bot de monitoreo de precios para Swappa💚.\n\n"
         "<b>Comandos disponibles:</b>\n"
-        "/remind - Configura una nueva alerta.\n"
-        "/myreminders - Muestra tus alertas.\n"
+        "/remind - Configura una nueva alerta y busca de inmediato.\n"
+        "/myreminders - Muestra tus alertas activas.\n"
         "/stopreminder - Elimina una alerta.\n"
-        "/help - Ayuda detallada."
+        "/help - Muestra las instrucciones detalladas.\n\n"
+        "<i>Hecho con mucho ❤ por @devmauro</i>"
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "<b>✨ Instrucciones para /remind:</b>\n\n"
-        "Formato:\n"
-        "/remind [URL] [PRECIO_MAX] [CONDICION] [BATERIA] [TIEMPO]\n\n"
-        "Ejemplo:\n"
-        "/remind https://swappa.com/listings/iphone-13 400 Good 90 1h"
+        "Debes proporcionar 5 parámetros:\n"
+        "1. URL de Swappa\n"
+        "2. Precio Máximo\n"
+        "3. Condición (Good, Mint, New, Fair, Open Box, etc.)\n"
+        "4. Batería Mínima (<b>Usa 0 si no quieres filtrar por batería</b>)\n"
+        "5. Frecuencia (ej. <b>30m</b> para 30 minutos, <b>2h</b> para 2 horas)\n\n"
+        "<b>Ejemplo (cada 2 horas):</b>\n"
+        "/remind https://swappa.com/listings/apple-iphone-15 700 Good 90 2h\n\n"
+        "<b>Ejemplo (cada 45 minutos):</b>\n"
+        "/remind https://swappa.com/listings/google-pixel-8 400 Good 0 45m\n\n"
+        "<b>Recuerda el formato:</b>\n"
+        "/remind [url_swappa] [precio_max] [condicion] [bateria] [tiempo]"
     )
 
 async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -346,7 +355,7 @@ async def my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"📱 <b>{r.get('device_name', 'Producto')}</b>\n"
         msg += f"🆔 <b>ID:</b> <code>{r['reminder_id']}</code>\n"
         msg += f"💰 <b>Max:</b> ${r['max_price']}\n"
-        msg += f"✨ <b>Cond:</b> {r['condition']}\n"
+        msg += f"✨ <b>Condición:</b> {r['condition']}\n"
         msg += f"🔋 <b>Bat Mín:</b> {bat}\n"
         msg += f"⏰ <b>Cada:</b> {freq_str}\n"
     
@@ -355,7 +364,7 @@ async def my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stop_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Dame el ID.")
+        await update.message.reply_text("🗣 Recuerda agregar el ID al ejecutar el comando.")
         return
     
     conn = db_connect()
@@ -365,7 +374,7 @@ async def stop_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
     conn.close()
 
-    await update.message.reply_text(f"✅ Eliminado." if cnt > 0 else "❌ No encontrado.")
+    await update.message.reply_text(f"✅ Recordatorio eliminado." if cnt > 0 else "❌ Recordatorio no encontrado.")
 
 # --- Ejecución ---
 async def run_scheduler_check():
@@ -410,3 +419,4 @@ if __name__ == '__main__':
         asyncio.run(run_scheduler_check())
     else:
         run_bot_polling()
+
