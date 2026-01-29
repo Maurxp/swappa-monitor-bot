@@ -58,7 +58,7 @@ def setup_database():
 # --- Obtener el Nombre del Producto ---
 def get_device_name(url: str):
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
         page = requests.get(url, headers=headers)
         page.raise_for_status()
         soup = BeautifulSoup(page.content, 'html.parser')
@@ -419,4 +419,5 @@ if __name__ == '__main__':
         asyncio.run(run_scheduler_check())
     else:
         run_bot_polling()
+
 
