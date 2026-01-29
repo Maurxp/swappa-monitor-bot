@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Credenciales ---
+# --- Obtener credenciales ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
@@ -58,7 +58,7 @@ def setup_database():
 def get_device_name(url: str):
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-        page = requests.get(url, headers=headers, timeout=10)
+        page = requests.get(url, headers=headers)
         page.raise_for_status()
         soup = BeautifulSoup(page.content, 'html.parser')
         
@@ -83,18 +83,17 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
     processed_links = set()
     
     try:
+        # --- CORRECCIÓN CRÍTICA DE CHROME ---
         options = uc.ChromeOptions()
-        # Opciones críticas para estabilidad en Heroku
-        options.add_argument('--headless=new') # Modo headless moderno
+        options.add_argument('--headless=new') # Modo headless moderno y estable
         options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage") # Usa /tmp en lugar de /dev/shm
-        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu") # Vital para evitar crash gráfico
         options.add_argument("--disable-software-rasterizer")
         options.add_argument("--window-size=1920,1080")
-        options.add_argument("--disable-extensions")
-        options.add_argument("--remote-debugging-port=9222") # Ayuda a conectar si Chrome se cuelga
+        options.add_argument("--remote-debugging-port=9222") # Ayuda a estabilizar la conexión del driver
         
-        # Eliminamos version_main fija para permitir auto-detección
+        # Eliminamos version_main=139 para permitir auto-detección
         driver = uc.Chrome(options=options)
         
         for page_num in range(1, 4):
@@ -173,7 +172,6 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                             if "gb" in txt_lower or "tb" in txt_lower:
                                 almacenamiento = txt
                             elif "unlocked" in txt_lower: continue
-                            # Filtro Modelo
                             elif re.search(r'^[a-z]{1,2}\d{3,4}', txt_lower) or re.search(r'^\d+$', txt_lower):
                                 continue
                             else:
@@ -185,7 +183,7 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                     if precio > max_price: continue
                     if desired_condition.lower() not in estado.lower(): continue
                     
-                    # Filtro Batería
+                    # Filtro Batería: Solo si min_battery > 0
                     if min_battery > 0:
                         if bateria == 0 or bateria < min_battery: continue
                     
@@ -200,7 +198,7 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
             
             if found_on_page == 0 and page_num > 1: break
         
-        # --- MENSAJE ---
+        # --- MENSAJE DINÁMICO (Formato Original) ---
         if all_found_devices:
             all_found_devices.sort(key=lambda x: x['precio'])
             items_to_show = all_found_devices[:15]
@@ -210,12 +208,19 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
             for d in items_to_show:
                 msg += f"📱 <b>Precio: ${d['precio']}</b>\n"
                 msg += f"   - Estado: {d['estado']}\n"
+                
+                # Solo mostrar Batería si existe (>0)
                 if d['bateria'] > 0:
                      msg += f"   - Batería: {d['bateria']}%\n"
+                
+                # Solo mostrar Almacenamiento si no es N/A
                 if d['almacenamiento'] != "N/A":
                     msg += f"   - Almacenamiento: {d['almacenamiento']}\n"
+                
+                # Solo mostrar Color si no es N/A
                 if d['color'] != "N/A":
                     msg += f"   - Color: {d['color']}\n"
+                
                 msg += f"   - Vendedor: {d['vendedor']}\n"
                 msg += f"   - <a href='{d['link']}'>Ver Anuncio</a>\n\n"
             
@@ -226,9 +231,9 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
         return None
             
     except Exception as e:
-        logger.error(f"Error scraping: {e}")
-        # Mensaje de error amigable en lugar del stacktrace técnico
-        return f"⚠️ Problema temporal conectando con Swappa. Reintentando en el próximo ciclo."
+        logger.error(f"Error: {e}")
+        # Mensaje simplificado para evitar errores 400 en Telegram con stacktraces largos
+        return f"⚠️ Problema temporal conectando con Swappa. Reintentando..."
     finally:
         if driver: 
             try: driver.quit()
@@ -242,7 +247,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "<b>Instrucciones /remind:</b>\n"
         "/remind [URL] [PRECIO] [CONDICION] [BAT] [TIEMPO]\n\n"
-        "👉 Usa <b>0</b> en batería si no aplica."
+        "👉 <b>Importante:</b> Usa <b>0</b> en batería si buscas productos sin batería (AirPods, Laptops, etc)."
     )
 
 async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
