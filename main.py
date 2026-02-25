@@ -6,6 +6,7 @@ import asyncio
 import sys
 import psycopg2
 import requests # Usaremos requests para obtener el nombre del producto rápidamente
+import subprocess # <-- AÑADIDO: Para detectar la versión exacta de Chrome
 from psycopg2.extras import RealDictCursor
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -55,6 +56,17 @@ def setup_database():
         conn.commit()
     conn.close()
 
+# --- NUEVO: Detector Dinámico de Versión de Chrome ---
+def get_chrome_version():
+    try:
+        out = subprocess.check_output(['google-chrome', '--version']).decode('utf-8')
+        major_version = int(out.split(' ')[2].split('.')[0])
+        logger.info(f"Versión de Chrome detectada en Heroku: {major_version}")
+        return major_version
+    except Exception as e:
+        logger.warning(f"No se pudo autodetectar Chrome, usando 145 por defecto. Error: {e}")
+        return 145
+
 # --- Obtener el Nombre del Producto ---
 def get_device_name(url: str):
     try:
@@ -92,7 +104,9 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--window-size=1920,1080")
         
-        driver = uc.Chrome(options=options)
+        # --- MODIFICADO: Aplicar versión detectada ---
+        chrome_v = get_chrome_version()
+        driver = uc.Chrome(options=options, version_main=chrome_v)
         
         for page_num in range(1, 4):
             if page_num == 1:
@@ -419,5 +433,3 @@ if __name__ == '__main__':
         asyncio.run(run_scheduler_check())
     else:
         run_bot_polling()
-
-
