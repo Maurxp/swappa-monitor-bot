@@ -11,7 +11,7 @@ An automated marketplace monitoring and alert bot for [Swappa](https://swappa.co
 
 ## Overview
 
-Swappa is a curated peer-to-peer marketplace for consumer electronics. High-demand items—such as iPhones, Google Pixel smartphones, and MacBooks—often sell within minutes when listed at competitive prices or with high battery health (>90%). 
+Swappa is a curated peer-to-peer marketplace for consumer electronics. High-demand items—such as iPhones, Google Pixel smartphones, and MacBooks—often sell within minutes when listed at competitive prices or with high battery health (>90%).
 
 Manually monitoring Swappa requires continuous page refreshing and tedious inspection of individual device cards. **Swappa Monitor Bot** automates this surveillance 24/7. Users configure custom search alerts directly through Telegram. The bot continuously inspects marketplace listings, applies strict multi-parameter filters (price, condition, battery health), and sends instantaneous alerts with direct purchase links.
 
@@ -319,16 +319,19 @@ The repository includes standard Heroku configuration files:
    ```
 
 2. **Add Required Buildpacks:**
-   Because `undetected-chromedriver` requires Google Chrome and Chromedriver:
+   The application utilizes Chrome for Testing and Chromedriver via the modern buildpack:
    ```bash
    heroku buildpacks:add heroku/python
-   heroku buildpacks:add https://github.com/heroku/heroku-buildpack-google-chrome
+   heroku buildpacks:add https://github.com/heroku/heroku-buildpack-chrome-for-testing
    heroku buildpacks:add https://github.com/heroku/heroku-buildpack-chromedriver
    ```
 
-3. **Configure Environment Variables:**
+3. **Configure Environment Variables (Optional Chrome Overrides):**
    ```bash
    heroku config:set TELEGRAM_TOKEN="your_bot_token"
+   # Optional: Explicit Chrome binary or version override if ever needed:
+   # heroku config:set GOOGLE_CHROME_BIN="/app/.chrome-for-testing/chrome-linux64/chrome"
+   # heroku config:set CHROME_VERSION_MAIN=157
    ```
    *(Note: `DATABASE_URL` is configured automatically by Heroku Postgres).*
 
@@ -350,24 +353,36 @@ The repository includes standard Heroku configuration files:
 
 ---
 
+## Automated Testing
+
+The repository contains an automated test suite verifying version resolution, factory initialization, typed contracts, logging security, and regression parsers:
+
+```bash
+# Run all unit and regression tests:
+python -m unittest discover tests -v
+```
+
+---
+
 ## Troubleshooting
 
 | Issue | Cause | Solution |
 | :--- | :--- | :--- |
 | Bot terminates immediately on startup | Missing `TELEGRAM_TOKEN` or `DATABASE_URL` | Ensure environment variables are populated before running `main.py`. |
-| Chrome version detection error on Windows | `google-chrome` executable not in Windows PATH | The bot falls back to version 145 automatically. Ensure Chrome is installed. |
+| ChromeDetectionError on startup | Chrome executable not found in PATH or standard locations | Install Google Chrome or export `GOOGLE_CHROME_BIN` / `CHROME_PATH` pointing to the binary. |
 | `psycopg2.OperationalError: SSL error` | Postgres server does not support or require SSL | Verify connection string; `sslmode='require'` is hardcoded in `db_connect()`. |
 | Zero listings returned for valid searches | Swappa updated card CSS selectors | Check if class `xui_card_listing` is still in use on Swappa's desktop site. |
-| Telegram 400 Bad Request: Message too long | More than 15 results or extensive HTML markup | The bot caps output at 15 items to comply with Telegram's 4096 character limit. |
+| Scraper errors in logs | Temporary network timeout or Swappa anti-bot challenge | The scraper catches exceptions and sets `ScrapeStatus.ERROR`; alerts are suppressed so no crash logs are sent to users. |
 
 ---
 
 ## Security & Operational Best Practices
 
-1. **Zero Secrets in Code:** Never commit `.env` files or hardcode API keys or database connection strings.
-2. **Missing `.gitignore`:** The repository currently lacks a `.gitignore`. It is strongly recommended to add one to exclude `__pycache__/`, `.env`, and virtual environment folders.
-3. **SSL Database Enforcement:** All PostgreSQL traffic is forced over encrypted connections via `sslmode='require'`.
-4. **Exception Handling:** Error messages are caught gracefully, though raw exception strings should not be reflected to untrusted users in production.
+1. **Zero Secrets in Code:** Never commit `.env` files, production logs (`HEROKU_LOGS/`), API keys, or database connection strings.
+2. **Exclusion via `.gitignore`:** The repository enforces exclusion of logs, bytecode, and environment secrets via `.gitignore`.
+3. **Sensitive Token Redaction:** The logging subsystem applies `SensitiveTokenFilter` to automatically redact Telegram bot tokens from logs before output.
+4. **SSRF Protection:** All Swappa URLs submitted by users are strictly validated against `https://swappa.com/` before initiating requests or browser sessions.
+5. **SSL Database Enforcement:** All PostgreSQL traffic is forced over encrypted connections via `sslmode='require'`.
 
 ---
 
@@ -405,7 +420,7 @@ Contributions, bug reports, and suggestions are welcome!
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE) - see the `LICENSE` file for details.  
+This project is licensed under the [MIT License](LICENSE) - see the `LICENSE` file for details.
 Copyright (c) 2025 **Mauricio Perdomo**.
 
 ---
