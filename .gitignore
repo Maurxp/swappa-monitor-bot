@@ -38,7 +38,10 @@ venv.bak/
 .env.*
 !.env.example
 
-# Logs and incident artifacts containing credentials
+# Internal audit and incident documentation
+AUDIT_REPORTS/
+INCIDENT_REPORTS/
+# Local production logs
 HEROKU_LOGS/
 *.log
 

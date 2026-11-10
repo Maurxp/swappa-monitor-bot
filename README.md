@@ -160,13 +160,13 @@ sequenceDiagram
 
 ```text
 swappa-monitor-bot/
-├── AUDIT_REPORTS/                     # Technical, functional, and security audit documentation
-│   ├── 00_WORKSPACE_INVENTORY.md      # Baseline workspace & environment inventory
-│   ├── 01_FUNCTIONAL_ANALYSIS.md      # Reverse-engineering and feature verification matrix
-│   ├── 02_TECHNICAL_AUDIT.md          # Architectural, scraping, database & security audit
-│   ├── 03_TESTING_AND_VALIDATION.md   # Syntax, regex validation & test results
-│   ├── 04_DOCUMENTATION_REVIEW.md     # README verification against implementation
-│   └── FINAL_REPORT.md                # Comprehensive audit report and executive summary
+├── tests/                             # Automated test suite (unit, regression & integration)
+│   ├── test_chrome_resolver.py        # Chrome version & path resolution tests
+│   ├── test_contracts_and_consumers.py# ScrapeResult contracts & error isolation tests
+│   ├── test_regression_parsers.py     # Regex model & frequency validation tests
+│   ├── test_security_and_logging.py   # Token redaction & SSRF validation tests
+│   ├── test_uc_factory.py             # undetected-chromedriver factory tests
+│   └── test_uc_live_integration.py    # UC live integration test stub
 ├── LICENSE                            # MIT License (Mauricio Perdomo, 2025)
 ├── Procfile                           # Heroku process declaration (worker dyno)
 ├── requirements.txt                   # Declared Python dependencies
