@@ -149,8 +149,112 @@ def setup_database():
             cur.execute("ALTER TABLE reminders ADD COLUMN IF NOT EXISTS device_name TEXT;")
         except Exception:
             conn.rollback()
+
+        # Tabla de deduplicación persistente de anuncios notificados (M10.5)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS notified_listings (
+                id SERIAL PRIMARY KEY,
+                reminder_id VARCHAR(255) NOT NULL,
+                listing_key VARCHAR(255) NOT NULL,
+                notified_at BIGINT NOT NULL,
+                price REAL,
+                UNIQUE (reminder_id, listing_key)
+            );
+        """)
+        try:
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_notified_listings_lookup ON notified_listings (reminder_id, listing_key);")
+        except Exception:
+            conn.rollback()
+
         conn.commit()
     conn.close()
+
+def filter_unnotified_listings(reminder_id: str, items: list[dict]) -> list[dict]:
+    """
+    Filtra los anuncios ya notificados previamente para este recordatorio.
+    Retorna únicamente los anuncios nuevos que no han sido despachados.
+    """
+    if not items or psycopg2 is None or not DATABASE_URL:
+        return items
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            keys = [item.get('listing_id') or item.get('link') for item in items]
+            cur.execute("""
+                SELECT listing_key FROM notified_listings
+                WHERE reminder_id = %s AND listing_key = ANY(%s);
+            """, (reminder_id, keys))
+            already_notified = {row[0] for row in cur.fetchall()}
+        conn.close()
+        return [item for item in items if (item.get('listing_id') or item.get('link')) not in already_notified]
+    except Exception as e:
+        logger.warning(f"No se pudo consultar notified_listings en DB ({e}). Continuando sin filtro.")
+        return items
+
+def record_notified_listings(reminder_id: str, items: list[dict]):
+    """
+    Registra de manera idempotente los anuncios notificados tras confirmación de Telegram.
+    """
+    if not items or psycopg2 is None or not DATABASE_URL:
+        return
+    now = int(time.time())
+    try:
+        conn = db_connect()
+        with conn.cursor() as cur:
+            for item in items:
+                key = item.get('listing_id') or item.get('link')
+                price = item.get('precio', 0.0)
+                cur.execute("""
+                    INSERT INTO notified_listings (reminder_id, listing_key, notified_at, price)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (reminder_id, listing_key) DO NOTHING;
+                """, (reminder_id, key, now, price))
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"No se pudieron registrar anuncios notificados en DB ({e}).")
+
+def claim_due_reminders(batch_limit: int = 10, tolerance_seconds: int = 60) -> list[dict]:
+    """
+    Reclama atómicamente recordatorios vencidos desde PostgreSQL utilizando SELECT FOR UPDATE SKIP LOCKED
+    y actualizando last_checked en la misma transacción para evitar ejecuciones concurrentes entre dynos.
+    """
+    if psycopg2 is None or not DATABASE_URL:
+        return []
+    conn = db_connect()
+    claimed = []
+    now = int(time.time())
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, chat_id, reminder_id, url, max_price, condition, min_battery, frequency_seconds, last_checked, device_name
+                FROM reminders
+                WHERE (%s - last_checked) >= (frequency_seconds - %s)
+                ORDER BY last_checked ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED;
+            """, (now, tolerance_seconds, batch_limit))
+            rows = cur.fetchall()
+            if rows:
+                row_ids = [r['id'] for r in rows]
+                cur.execute(
+                    "UPDATE reminders SET last_checked = %s WHERE id = ANY(%s);",
+                    (now, row_ids)
+                )
+                conn.commit()
+                claimed = list(rows)
+    except Exception as e:
+        logger.error(f"Error reclamando recordatorios vencidos en DB: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return claimed
 
 # --- Detector Dinámico y Centralizado de Chrome ---
 def resolve_chrome_environment() -> tuple[str | None, int | None]:
@@ -259,47 +363,100 @@ def create_uc_driver():
     logger.info(f"Iniciando undetected_chromedriver con version_main={major_v}, browser_executable_path={bin_path}")
     return uc.Chrome(**kwargs)
 
-# --- Obtener el Nombre del Producto ---
+# --- Inferencia y Obtención del Nombre del Producto ---
+KNOWN_BRANDS_AND_TERMS = {
+    "apple": "Apple", "iphone": "iPhone", "ipad": "iPad", "ipod": "iPod",
+    "imac": "iMac", "macbook": "MacBook", "airpods": "AirPods", "airpod": "AirPod",
+    "samsung": "Samsung", "galaxy": "Galaxy", "google": "Google", "pixel": "Pixel",
+    "oneplus": "OnePlus", "motorola": "Motorola", "moto": "Moto", "nintendo": "Nintendo",
+    "switch": "Switch", "sony": "Sony", "playstation": "PlayStation", "microsoft": "Microsoft",
+    "xbox": "Xbox", "surface": "Surface", "lg": "LG", "asus": "ASUS", "lenovo": "Lenovo",
+    "dell": "Dell", "hp": "HP", "pro": "Pro", "max": "Max", "mini": "Mini", "plus": "Plus",
+    "ultra": "Ultra", "fe": "FE", "se": "SE", "xr": "XR", "xs": "XS", "xl": "XL",
+    "lte": "LTE", "5g": "5G", "4g": "4G", "oled": "OLED", "ps4": "PS4", "ps5": "PS5", "vr": "VR",
+}
+
+def extract_device_name_from_url(url: str) -> str | None:
+    """
+    Infiere el nombre amigable del dispositivo a partir del slug de la URL de Swappa.
+    Permite identificar productos (ej. 'Apple iPhone 13') con 0ms de latencia y sin
+    exponerse a bloqueos HTTP 403 de Cloudflare.
+    """
+    try:
+        path = urlparse(url).path.strip('/')
+        match = re.search(r'(?:listings|buy)/([a-zA-Z0-9\-]+)', path)
+        if not match:
+            return None
+        slug = match.group(1).lower()
+        parts = [p for p in slug.split('-') if p]
+        if not parts:
+            return None
+        formatted = []
+        for p in parts:
+            if p in KNOWN_BRANDS_AND_TERMS:
+                formatted.append(KNOWN_BRANDS_AND_TERMS[p])
+            elif re.match(r'^(?:[ivx]+)$', p):
+                formatted.append(p.upper())
+            elif re.match(r'^[a-z]\d+$', p):
+                formatted.append(p[0].upper() + p[1:])
+            else:
+                formatted.append(p.capitalize())
+        return ' '.join(formatted)
+    except Exception:
+        return None
+
 def get_device_name(url: str) -> str:
+    """
+    Obtiene el nombre del producto combinando inferencia de slug y metadatos de página.
+    Si la consulta HTTP falla (por ejemplo por HTTP 403 de Cloudflare o timeout),
+    se utiliza prioritariamente el nombre inferido del slug, garantizando que nunca
+    se retorne 'Producto Desconocido' para URLs válidas con slug identificable.
+    """
     if not is_valid_swappa_url(url):
         logger.warning(f"URL rechazada por validación SSRF: {url}")
         return "Producto Desconocido"
+
+    inferred_name = extract_device_name_from_url(url)
+
+    # Intentar obtener metadatos más específicos de la página web si es posible
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-        page = requests.get(url, headers=headers, timeout=15)
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        page = requests.get(url, headers=headers, timeout=5)
         page.raise_for_status()
-        if BeautifulSoup is None:
-            return "Producto Swappa"
-        soup = BeautifulSoup(page.content, 'html.parser')
-
-        # Buscar enlace de breadcrumb específico para el modelo
-        name_link = soup.find('a', href=re.compile(r'^/listings/'), title=re.compile(r'^Buy '))
-        if name_link:
-            return name_link.get_text(strip=True)
-
-        # Fallback al h1
-        h1 = soup.find('h1')
-        if h1:
-            return h1.get_text(strip=True).replace(' on Swappa', '')
-
-        return "Producto Swappa"
+        if BeautifulSoup is not None:
+            soup = BeautifulSoup(page.content, 'html.parser')
+            name_link = soup.find('a', href=re.compile(r'^/listings/'), title=re.compile(r'^Buy '))
+            if name_link:
+                return name_link.get_text(strip=True)
+            h1 = soup.find('h1')
+            if h1:
+                return h1.get_text(strip=True).replace(' on Swappa', '')
     except Exception as e:
-        logger.error(f"No se pudo obtener el nombre del dispositivo de {url}: {e}")
-        return "Producto Desconocido"
+        logger.info(f"Consulta HTTP para nombre de dispositivo en {url} no disponible ({e}). Usando inferencia local.")
+
+    if inferred_name:
+        return inferred_name
+
+    return "Producto Swappa"
 
 # --- Lógica de Scraping con Contrato ScrapeResult ---
-def scrape_swappa(url: str, max_price: float, desired_condition: str, min_battery: int, device_name: str) -> ScrapeResult:
+def scrape_swappa(url: str, max_price: float, desired_condition: str, min_battery: int, device_name: str, driver=None) -> ScrapeResult:
     if not is_valid_swappa_url(url):
         logger.warning(f"URL no válida en scrape_swappa: {url}")
         return ScrapeResult(status=ScrapeStatus.ERROR, error_message="URL no válida o no permitida.")
 
     logger.info(f"Iniciando búsqueda ESTRICTA para {device_name} en URL base: {url}")
-    driver = None
+    external_driver = driver is not None
     all_found_devices = []
     processed_links = set()
 
     try:
-        driver = create_uc_driver()
+        if driver is None:
+            driver = create_uc_driver()
+
+        card_selector = ".xui_card_listing, [class*='card_listing'], .listing-card, [data-listing]"
+        empty_selector = ".no-listings, #listings_none, [data-testid='no-results'], div.empty-state"
+        combined_selector = f"{card_selector}, {empty_selector}"
 
         for page_num in range(1, 4):
             if page_num == 1:
@@ -311,45 +468,104 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
             logger.info(f"Revisando página {page_num}: {page_url}")
             driver.get(page_url)
 
-            try:
-                wait = WebDriverWait(driver, 15)
-                wait.until(EC.presence_of_element_located((By.CLASS_NAME, "xui_card_listing")))
-            except Exception:
-                logger.info(f"Fin de resultados o error en página {page_num}.")
-                break
+            # 1. Comprobar pantallas de bloqueo / Cloudflare Turnstile / Bot Challenge
+            page_title = driver.title or ""
+            if any(marker in page_title.lower() for marker in ["just a moment...", "attention required", "cloudflare", "security check"]):
+                logger.warning(f"Desafío anti-bot / Cloudflare detectado en '{page_title}' para {url}")
+                return ScrapeResult(
+                    status=ScrapeStatus.ERROR,
+                    error_message=f"Página bloqueada por verificación Cloudflare / Anti-bot ('{page_title}')."
+                )
+
+            # 2. Espera explícita para aparición de tarjetas o estado vacío
+            timed_out = False
+            if WebDriverWait is not None and EC is not None and By is not None:
+                try:
+                    wait = WebDriverWait(driver, 15)
+                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, combined_selector)))
+                except Exception:
+                    timed_out = True
+
+            if timed_out:
+                if page_num == 1:
+                    # En página 1, timeout sin elementos es un fallo técnico de carga o red, NUNCA resultado vacío
+                    logger.error(f"Timeout de 15s esperando publicaciones en página 1 de {device_name}. Título actual: '{driver.title}'")
+                    return ScrapeResult(
+                        status=ScrapeStatus.ERROR,
+                        error_message=f"Tiempo de espera agotado (timeout) cargando publicaciones de {device_name} en Swappa."
+                    )
+                else:
+                    # En páginas 2 o 3, timeout representa simplemente el fin del catálogo
+                    logger.info(f"Fin de resultados alcanzado en página {page_num}.")
+                    break
+
+            if BeautifulSoup is None:
+                return ScrapeResult(status=ScrapeStatus.ERROR, error_message="BeautifulSoup no está instalado.")
 
             soup = BeautifulSoup(driver.page_source, 'html.parser')
-            anuncios = soup.find_all("div", class_="xui_card_listing")
+            anuncios = soup.select(card_selector)
+
+            # Verificar si la página explícitamente reporta estado vacío
+            if not anuncios:
+                body_text = soup.get_text().lower()
+                has_empty_indicator = any(phrase in body_text for phrase in [
+                    "no listings found", "no active listings", "there are currently no listings",
+                    "0 listings", "no matching listings", "no items found"
+                ]) or bool(soup.select(empty_selector))
+
+                if has_empty_indicator and page_num == 1:
+                    logger.info(f"Página 1 cargó exitosamente pero Swappa confirma 0 publicaciones para {device_name}.")
+                    return ScrapeResult(status=ScrapeStatus.EMPTY, items=[])
+                elif page_num == 1:
+                    logger.warning(f"No se detectaron tarjetas ni indicador vacío en página 1 para {device_name}.")
+                    return ScrapeResult(
+                        status=ScrapeStatus.ERROR,
+                        error_message=f"Estructura DOM de Swappa no reconocida para {device_name}."
+                    )
+                else:
+                    break
 
             found_on_page = 0
 
             for anuncio in anuncios:
                 try:
-                    # 1. ENLACE
+                    # 1. ENLACE Y LISTING ID
                     link_tag = anuncio.find('a', href=re.compile(r'/listing/view/'))
                     if not link_tag:
                         price_div = anuncio.find("div", class_="price")
                         if price_div:
                             link_tag = price_div.find("a", href=True)
+                    if not link_tag:
+                        link_tag = anuncio.find('a', href=re.compile(r'/listing/'))
 
                     if not link_tag:
                         continue
 
-                    href = link_tag['href']
+                    href = link_tag.get('href', '')
                     link = "https://swappa.com" + href if not href.startswith("http") else href
 
                     if link in processed_links:
                         continue
                     processed_links.add(link)
 
+                    # Extraer ID estable de Swappa (ej. 'ABCD1234')
+                    id_match = re.search(r'/listing/view/([a-zA-Z0-9]+)', href)
+                    listing_id = id_match.group(1) if id_match else link
+
                     # 2. PRECIO
                     precio_tag = anuncio.find('span', itemprop='price')
                     if not precio_tag:
+                        precio_tag = anuncio.find(class_=re.compile(r'price'))
+                    if not precio_tag:
                         continue
-                    precio = float(precio_tag.text.strip().replace(',', '').replace('$', ''))
+                    precio_text = precio_tag.text.strip().replace(',', '').replace('$', '')
+                    precio_match = re.search(r'[\d.]+', precio_text)
+                    if not precio_match:
+                        continue
+                    precio = float(precio_match.group(0))
 
                     # 3. VENDEDOR
-                    vendedor_tag = anuncio.find('div', class_='seller_name')
+                    vendedor_tag = anuncio.find('div', class_=re.compile(r'seller'))
                     vendedor = vendedor_tag.text.strip() if vendedor_tag else "N/A"
 
                     # 4. CONDICIÓN Y ATRIBUTOS
@@ -358,14 +574,13 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                     color = "N/A"
                     almacenamiento = "N/A"
 
-                    attrs_div = anuncio.find("div", class_="attrs")
+                    attrs_div = anuncio.find("div", class_=re.compile(r'attrs|details'))
                     if attrs_div:
                         # A. Condición (Prioridad Meta Tag)
                         cond_meta = attrs_div.find("meta", itemprop="itemCondition")
                         if cond_meta and cond_meta.parent:
                             estado = cond_meta.parent.get_text(strip=True)
                         else:
-                            # Fallback texto
                             for sp in attrs_div.find_all("span", class_="attr"):
                                 txt = sp.get_text(" ", strip=True)
                                 if txt in ["Mint", "Good", "Fair", "New", "Open Box"]:
@@ -373,7 +588,7 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                                     break
 
                         # B. Batería
-                        batt_span = attrs_div.find("span", class_="color_battery")
+                        batt_span = attrs_div.find("span", class_=re.compile(r'battery'))
                         if batt_span:
                             batt_text = batt_span.get_text(strip=True)
                             match = re.search(r'(\d+)%', batt_text)
@@ -387,18 +602,11 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                             txt = attr.get_text(" ", strip=True).strip()
                             txt_lower = txt.lower()
 
-                            # Ignorar estado conocido o garantía
-                            if txt == estado:
-                                continue
-                            if "warranty" in txt_lower:
+                            if txt == estado or "warranty" in txt_lower or "unlocked" in txt_lower:
                                 continue
 
                             if "gb" in txt_lower or "tb" in txt_lower:
                                 almacenamiento = txt
-                            # Filtro para evitar que Modelo o Unlocked se marque como Color
-                            elif "unlocked" in txt_lower:
-                                continue
-                            # Regex mejorada para ignorar modelos con guión (ej: A2482, SM-S908U, SM-S918B)
                             elif re.search(r'^[a-z]{1,2}-?[a-z]?\d{3,4}[a-z0-9]*', txt_lower) or re.search(r'^\d+$', txt_lower):
                                 continue
                             else:
@@ -408,20 +616,18 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
                         continue
 
                     # --- FILTRADO ESTRICTO ---
-                    # 1. Filtro Precio
                     if precio > max_price:
                         continue
 
-                    # 2. Filtro Condición
                     if desired_condition.lower() not in estado.lower():
                         continue
 
-                    # 3. Filtro Batería ESTRICTO
                     if min_battery > 0:
                         if bateria == 0 or bateria < min_battery:
                             continue
 
                     all_found_devices.append({
+                        "listing_id": listing_id,
                         "precio": precio,
                         "estado": estado,
                         "bateria": bateria,
@@ -469,7 +675,7 @@ def scrape_swappa(url: str, max_price: float, desired_condition: str, min_batter
         logger.error(f"Error durante scraping de {device_name}: {e}")
         return ScrapeResult(status=ScrapeStatus.ERROR, error_message=str(e))
     finally:
-        if driver:
+        if driver and not external_driver:
             try:
                 driver.quit()
             except Exception as e_quit:
@@ -507,7 +713,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.message.chat_id)
     args = context.args
-    if len(args) != 5:
+    if not args or len(args) != 5:
         await update.message.reply_html("⚠️ Formato incorrecto. Usa /help para ver las instrucciones.")
         return
     try:
@@ -517,15 +723,34 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_html("⚠️ La URL debe ser un enlace válido de Swappa comenzando con <code>https://swappa.com/</code>.")
             return
 
-        # Validación estricta de frecuencia
-        num_match = re.search(r'^\d+', frequency_str)
-        unit_match = re.search(r'[a-zA-Z]+$', frequency_str)
-        if not num_match or not unit_match or unit_match.group(0).lower() not in ['h', 'm']:
-            await update.message.reply_html("⚠️ Formato de tiempo inválido. Usa por ejemplo <b>30m</b> (30 minutos) o <b>2h</b> (2 horas).")
+        # Validación estricta de precio
+        try:
+            max_price_f = float(max_price)
+            if max_price_f <= 0:
+                await update.message.reply_html("⚠️ El precio máximo debe ser un valor positivo mayor a 0.")
+                return
+        except ValueError:
+            await update.message.reply_html("❌ Precio inválido. Asegúrate de ingresar un número válido (ej. 340).")
             return
 
-        num = int(num_match.group(0))
-        unit = unit_match.group(0).lower()
+        # Validación estricta de batería
+        try:
+            min_battery_i = int(min_battery)
+            if min_battery_i < 0 or min_battery_i > 100:
+                await update.message.reply_html("⚠️ La batería mínima debe estar entre 0 y 100 (usa 0 si no deseas filtrar por batería).")
+                return
+        except ValueError:
+            await update.message.reply_html("❌ Batería inválida. Asegúrate de ingresar un número entero entre 0 y 100.")
+            return
+
+        # Validación estricta de frecuencia
+        freq_match = re.search(r'^(\d+)([hmHM])$', frequency_str.strip())
+        if not freq_match:
+            await update.message.reply_html("⚠️ Formato de tiempo inválido. Usa por ejemplo <b>15m</b> (15 minutos) o <b>2h</b> (2 horas).")
+            return
+
+        num = int(freq_match.group(1))
+        unit = freq_match.group(2).lower()
         if num <= 0:
             await update.message.reply_html("⚠️ El tiempo debe ser mayor a 0.")
             return
@@ -536,20 +761,25 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🤖 Obteniendo información...")
         device_name = await asyncio.to_thread(get_device_name, url)
 
-        max_price_f = float(max_price)
-        min_battery_i = int(min_battery)
-
         reminder_id = f"reminder_{chat_id}_{int(time.time())}"
 
-        conn = db_connect()
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO reminders (chat_id, reminder_id, url, max_price, condition, min_battery, frequency_seconds, last_checked, device_name) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (chat_id, reminder_id, url, max_price_f, condition, min_battery_i, seconds, int(time.time()), device_name)
-            )
-            conn.commit()
-        conn.close()
+        # Persistencia atómica en PostgreSQL previa a la confirmación
+        try:
+            conn = db_connect()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO reminders (chat_id, reminder_id, url, max_price, condition, min_battery, frequency_seconds, last_checked, device_name) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (chat_id, reminder_id, url, max_price_f, condition, min_battery_i, seconds, int(time.time()), device_name)
+                )
+                conn.commit()
+            conn.close()
+        except Exception as db_err:
+            logger.error(f"Error persistiendo recordatorio en DB: {db_err}")
+            await update.message.reply_html("❌ No fue posible guardar el recordatorio en la base de datos. Inténtalo más tarde.")
+            return
 
+        # Confirmación emitida ÚNICAMENTE tras inserción exitosa en base de datos
         await update.message.reply_html(
             f"✅ <b>Recordatorio configurado para {device_name}.</b>\nFrecuencia: {display_freq}.\n\n<i>Buscando ahora...</i> 🔍"
         )
@@ -558,16 +788,24 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with SCRAPE_SEMAPHORE:
             res: ScrapeResult = await asyncio.to_thread(scrape_swappa, url, max_price_f, condition, min_battery_i, device_name)
 
-        if res.status == ScrapeStatus.SUCCESS and res.formatted_message:
-            await update.message.reply_html(res.formatted_message, disable_web_page_preview=True)
+        if res.status == ScrapeStatus.SUCCESS and res.items:
+            # Filtrar ofertas para deduplicación
+            new_items = await asyncio.to_thread(filter_unnotified_listings, reminder_id, res.items)
+            if new_items:
+                await update.message.reply_html(res.formatted_message, disable_web_page_preview=True)
+                # Registrar como notificadas solo tras confirmación de envío
+                await asyncio.to_thread(record_notified_listings, reminder_id, new_items)
+            else:
+                await update.message.reply_text("ℹ️ Las ofertas encontradas ya fueron notificadas previamente.")
         elif res.status == ScrapeStatus.EMPTY:
             await update.message.reply_text("😥 No se encontraron ofertas que cumplan tus criterios en este momento.")
         else:
             logger.error(f"Fallo en búsqueda inmediata /remind para {device_name}: {res.error_message}")
-            await update.message.reply_text("⚠️ No fue posible consultar las ofertas de Swappa en este momento. El recordatorio quedó programado y se ejecutará automáticamente.")
+            await update.message.reply_text(
+                "⚠️ No fue posible consultar las ofertas de Swappa en este momento (tiempo de espera agotado o bloqueo temporal). "
+                "El recordatorio quedó guardado y se ejecutará automáticamente en el próximo intervalo."
+            )
 
-    except ValueError:
-        await update.message.reply_html("❌ Precio o batería inválidos. Asegúrate de ingresar números válidos.")
     except Exception as e:
         logger.error(f"Error en remind: {e}")
         await update.message.reply_html("❌ Error procesando los datos. Verifica el formato con /help.")
@@ -606,56 +844,121 @@ async def stop_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🗣 Recuerda agregar el ID al ejecutar el comando.")
         return
 
+    rem_id = context.args[0].strip()
+    chat_id = str(update.message.chat_id)
     conn = db_connect()
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM reminders WHERE reminder_id = %s AND chat_id = %s", (context.args[0], str(update.message.chat_id)))
+        # Limpiar deduplicación asociada
+        try:
+            cur.execute("DELETE FROM notified_listings WHERE reminder_id = %s", (rem_id,))
+        except Exception:
+            pass
+        cur.execute("DELETE FROM reminders WHERE reminder_id = %s AND chat_id = %s", (rem_id, chat_id))
         cnt = cur.rowcount
         conn.commit()
     conn.close()
 
     await update.message.reply_text("✅ Recordatorio eliminado." if cnt > 0 else "❌ Recordatorio no encontrado.")
 
-# --- Ejecución del Scheduler ---
-async def run_scheduler_check():
-    conn = db_connect()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT * FROM reminders")
-        rows = cur.fetchall()
-    conn.close()
+# --- Ejecución del Scheduler y Despachador Periódico ---
+async def run_scheduler_check(bot=None):
+    """
+    Ejecuta la revisión periódica de recordatorios vencidos.
+    Reclama atómicamente los recordatorios con SELECT FOR UPDATE SKIP LOCKED
+    y reutiliza una única sesión de Chrome para procesar todo el lote,
+    evitando Error R14 de memoria y asegurando ejecución oportuna.
+    """
+    due_reminders = await asyncio.to_thread(claim_due_reminders, 10, 60)
+    if not due_reminders:
+        logger.debug("No hay recordatorios pendientes en este ciclo.")
+        return
 
-    bot = Application.builder().token(TELEGRAM_TOKEN).build().bot
-    now = int(time.time())
+    logger.info(f"Procesando lote de {len(due_reminders)} recordatorios vencidos en scheduler...")
 
-    for r in rows:
-        if now - r['last_checked'] > r['frequency_seconds']:
-            # Ejecución protegida con semáforo
-            async with SCRAPE_SEMAPHORE:
+    if bot is None:
+        if Application is None or not TELEGRAM_TOKEN:
+            logger.error("No se puede inicializar Telegram Bot para scheduler.")
+            return
+        bot = Application.builder().token(TELEGRAM_TOKEN).build().bot
+
+    driver = None
+    try:
+        # Abrir UNA SOLA sesión de Chrome para todo el lote
+        try:
+            driver = await asyncio.to_thread(create_uc_driver)
+        except Exception as drv_err:
+            logger.error(f"No se pudo inicializar Chrome para el lote de scheduler: {drv_err}")
+            return
+
+        for r in due_reminders:
+            dev_name = r.get('device_name') or 'Producto'
+            rem_id = r['reminder_id']
+            try:
                 res: ScrapeResult = await asyncio.to_thread(
-                    scrape_swappa, r['url'], r['max_price'], r['condition'], r['min_battery'], r['device_name']
+                    scrape_swappa, r['url'], r['max_price'], r['condition'], r['min_battery'], dev_name, driver
                 )
+            except Exception as scrape_err:
+                logger.error(f"Scheduler falló al procesar {dev_name}: {scrape_err}")
+                continue
 
-            c2 = db_connect()
-            with c2.cursor() as cur2:
-                cur2.execute("UPDATE reminders SET last_checked = %s WHERE id = %s", (now, r['id']))
-                c2.commit()
-            c2.close()
-
-            # Solo ScrapeStatus.SUCCESS puede despachar alertas
-            if res.status == ScrapeStatus.SUCCESS and res.formatted_message:
-                try:
-                    await bot.send_message(chat_id=r['chat_id'], text=res.formatted_message, parse_mode='HTML', disable_web_page_preview=True)
-                except Exception as e:
-                    logger.error(f"Error telegram enviando notificación: {e}")
+            if res.status == ScrapeStatus.SUCCESS and res.items:
+                # Filtrar anuncios ya notificados previamente
+                new_items = await asyncio.to_thread(filter_unnotified_listings, rem_id, res.items)
+                if new_items:
+                    try:
+                        await bot.send_message(
+                            chat_id=r['chat_id'],
+                            text=res.formatted_message,
+                            parse_mode='HTML',
+                            disable_web_page_preview=True
+                        )
+                        # Registrar como notificados tras confirmación exitosa de Telegram
+                        await asyncio.to_thread(record_notified_listings, rem_id, new_items)
+                        logger.info(f"Notificación enviada a {r['chat_id']} con {len(new_items)} nuevas ofertas de {dev_name}.")
+                    except Exception as tg_err:
+                        logger.error(f"Error de Telegram enviando notificación de {dev_name}: {tg_err}")
+                else:
+                    logger.info(f"Ofertas encontradas para {dev_name} ya fueron notificadas previamente. Omitiendo mensaje.")
             elif res.status == ScrapeStatus.ERROR:
-                logger.error(f"Scheduler falló al procesar {r.get('device_name')}: {res.error_message}")
-            # ScrapeStatus.EMPTY no genera ninguna alerta
+                logger.error(f"Scheduler: Scraper retornó ERROR para {dev_name}: {res.error_message}")
+            else:
+                logger.info(f"Scheduler: Sin ofertas coincidentes para {dev_name} (EMPTY).")
+
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception as e_quit:
+                logger.debug(f"Error cerrando driver de lote: {e_quit}")
+
+async def periodic_scheduler_worker(bot):
+    """
+    Bucle en segundo plano ejecutado dentro del worker dyno.
+    Comprueba recordatorios vencidos cada 60 segundos, permitiendo que recordatorios
+    de 15m, 30m, etc. se ejecuten con precisión temporal sin depender del ciclo de 10 min de Heroku.
+    """
+    logger.info("Iniciando despachador periódico interno en worker...")
+    await asyncio.sleep(30)  # Espera inicial tras arranque del dyno
+    while True:
+        try:
+            await run_scheduler_check(bot=bot)
+        except asyncio.CancelledError:
+            logger.info("Despachador periódico detenido.")
+            break
+        except Exception as e:
+            logger.error(f"Error inesperado en despachador periódico interno: {e}")
+        await asyncio.sleep(60)
+
+async def post_init_callback(application: Application):
+    """Callback invocado por python-telegram-bot al iniciar el polling."""
+    asyncio.create_task(periodic_scheduler_worker(application.bot))
 
 def run_bot_polling():
     if not DATABASE_URL or not TELEGRAM_TOKEN:
         logger.critical("DATABASE_URL o TELEGRAM_TOKEN no están configurados. Abortando inicio del bot.")
         return
     setup_database()
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init_callback).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("remind", remind))

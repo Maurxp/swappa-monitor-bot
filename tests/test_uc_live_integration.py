@@ -29,6 +29,11 @@ class TestUCLiveIntegration(unittest.TestCase):
         if not bin_path:
             self.skipTest("LIMITACIÓN DE ENTORNO LOCAL: Binario de Chrome no resuelto en host local.")
 
+        try:
+            import undetected_chromedriver as uc
+        except ImportError:
+            self.skipTest("LIMITACIÓN DE ENTORNO LOCAL: undetected_chromedriver no está instalado en este entorno.")
+
         driver = None
         try:
             driver = create_uc_driver()
