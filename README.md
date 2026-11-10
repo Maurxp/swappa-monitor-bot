@@ -20,14 +20,17 @@ Manually monitoring Swappa requires continuous page refreshing and tedious inspe
 ## Features
 
 * **Anti-Bot Resilient Scraping:** Leverages `undetected-chromedriver` in headless mode to bypass Cloudflare perimeter challenges and render dynamic JavaScript content.
+* **Slug-First Product Inference:** Extracts canonical device titles (e.g. `apple-iphone-13` → `Apple iPhone 13`) with 0ms latency, preventing Cloudflare HTTP 403 blocks from yielding generic titles.
 * **Dynamic Chrome Versioning:** Inspects the host environment's Google Chrome binary at runtime to synchronize Chromedriver versions dynamically.
 * **Strict Multi-Criteria Filtering:**
   * **Price Threshold:** Discards any listing exceeding the user's upper limit.
   * **Condition Matching:** Filters by cosmetic grade (`Mint`, `Good`, `Fair`, `New`, `Open Box`).
   * **Strict Battery Health:** Filters devices by reported battery percentage (e.g., `>= 90%`). Listings omitting battery percentages are strictly excluded when battery monitoring is enabled.
+* **Persistent Listing Deduplication:** Employs a dedicated `notified_listings` PostgreSQL table to prevent repetitive alerts for the same offer across check cycles.
+* **Memory & Concurrency Control:** Reuses a single Chrome instance per scheduler batch and uses `SELECT ... FOR UPDATE SKIP LOCKED` to prevent duplicate dyno execution and eliminate Heroku `Error R14` memory spikes.
 * **Multi-Page Pagination:** Scrapes across up to 3 pages per target URL with anti-duplicate link tracking.
 * **Interactive Telegram Interface:** Full command suite for registering, listing, and canceling monitors.
-* **Dual Execution Modes:** Supports continuous Telegram polling via a worker process, as well as periodic batch surveillance via CLI (`run_scheduler_check`) for cron or Heroku Scheduler integration.
+* **Dual Execution & Hybrid Dispatcher:** Continuous polling with an internal 60s asynchronous dispatcher in the worker dyno, plus support for Heroku Scheduler batch execution as high-availability watchdog.
 * **Persistent Storage:** Retains alert configurations and execution timestamps in PostgreSQL with SSL encryption.
 
 ---
@@ -160,13 +163,17 @@ sequenceDiagram
 
 ```text
 swappa-monitor-bot/
-├── tests/                             # Automated test suite (unit, regression & integration)
+├── tests/                             # Automated test suite (34 unit, regression & e2e tests)
 │   ├── test_chrome_resolver.py        # Chrome version & path resolution tests
 │   ├── test_contracts_and_consumers.py# ScrapeResult contracts & error isolation tests
 │   ├── test_regression_parsers.py     # Regex model & frequency validation tests
 │   ├── test_security_and_logging.py   # Token redaction & SSRF validation tests
 │   ├── test_uc_factory.py             # undetected-chromedriver factory tests
-│   └── test_uc_live_integration.py    # UC live integration test stub
+│   ├── test_uc_live_integration.py    # UC live integration test stub
+│   ├── test_m10_product_and_parser.py # Slug-first inference & parameter validation tests
+│   ├── test_m10_scraper_resilience.py # DOM selector robustness & timeout tests
+│   ├── test_m10_scheduler_and_dedup.py# Concurrency & listing deduplication tests
+│   └── test_m10_e2e_lifecycle.py      # End-to-end reminder lifecycle pipeline test
 ├── LICENSE                            # MIT License (Mauricio Perdomo, 2025)
 ├── Procfile                           # Heroku process declaration (worker dyno)
 ├── requirements.txt                   # Declared Python dependencies
@@ -245,8 +252,9 @@ $env:DATABASE_URL="postgresql://user:password@host:5432/dbname"
 
 The database schema is initialized automatically when the application starts via `setup_database()`.
 
-### Table Schema (`reminders`)
+### Table Schemas
 
+#### 1. `reminders` (Active Alert Configurations)
 ```sql
 CREATE TABLE IF NOT EXISTS reminders (
     id SERIAL PRIMARY KEY,
@@ -260,6 +268,19 @@ CREATE TABLE IF NOT EXISTS reminders (
     last_checked BIGINT NOT NULL,
     device_name TEXT
 );
+```
+
+#### 2. `notified_listings` (Persistent Listing Deduplication)
+```sql
+CREATE TABLE IF NOT EXISTS notified_listings (
+    id SERIAL PRIMARY KEY,
+    reminder_id VARCHAR(255) NOT NULL,
+    listing_key VARCHAR(255) NOT NULL,
+    notified_at BIGINT NOT NULL,
+    price REAL,
+    UNIQUE (reminder_id, listing_key)
+);
+CREATE INDEX IF NOT EXISTS idx_notified_listings_lookup ON notified_listings (reminder_id, listing_key);
 ```
 
 * SSL connections are required (`sslmode='require'`).
